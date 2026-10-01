@@ -1,6 +1,5 @@
 //! Network transport primitives.
 
-pub mod activity;
 pub mod backend;
 mod fd_budget;
 mod idle;

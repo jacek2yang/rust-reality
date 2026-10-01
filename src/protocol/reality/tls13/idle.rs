@@ -8,7 +8,7 @@
 
 use std::{fmt, io, pin::Pin, sync::Arc, time::Duration};
 
-use crate::transport::activity::SessionActivity;
+use crate::io_activity::SessionActivity;
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},

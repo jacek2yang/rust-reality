@@ -46,9 +46,9 @@ use super::{
 };
 use crate::config::node::entry::EntryConfig;
 use crate::config::node::routing::DomainStrategy;
+use crate::io_activity::{SESSION_IDLE_WINDOW, SessionActivity, WRITE_STALL_TIMEOUT};
 use crate::runtime::policy::EffectivePolicy;
 use crate::runtime::policy::ResourceGovernorPolicy;
-use crate::transport::activity::{SESSION_IDLE_WINDOW, SessionActivity, WRITE_STALL_TIMEOUT};
 use crate::transport::{
     DirectionalRelayContext, RelayBackend, RelayContext, RelayDirection, RelayOutcome, TcpRelay,
 };

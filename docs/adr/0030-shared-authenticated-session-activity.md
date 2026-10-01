@@ -19,8 +19,10 @@ We do not copy its exact timeout values or socket ownership model.
 
 ## Decision
 
-The transport owns a shared activity object; the Vision runtime adapter owns
-one connection-level coordinator. Every successful nonempty socket read,
+The neutral I/O activity module owns a shared observation-only object; it
+exposes no transport or protocol capability. TLS application I/O and raw
+transport both report progress to it. The Vision runtime adapter owns one
+connection-level coordinator. Every successful nonempty socket read,
 partial write or splice operation marks activity once. A relaxed atomic flag
 avoids clock reads, locks, allocations and cross-direction timer resets on
 progress. The coordinator samples every five minutes, reclaiming completely

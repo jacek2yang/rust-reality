@@ -187,7 +187,7 @@ impl<R> TlsApplicationReader<R> {
     /// Switches authenticated data reads to connection-wide activity.
     pub(crate) fn set_activity(
         &mut self,
-        activity: std::sync::Arc<crate::transport::activity::SessionActivity>,
+        activity: std::sync::Arc<crate::io_activity::SessionActivity>,
     ) {
         self.idle.set_activity(activity);
     }
@@ -233,7 +233,7 @@ impl<W> TlsApplicationWriter<W> {
     /// Attaches the same activity state as the peer read direction.
     pub(crate) fn set_activity(
         &mut self,
-        activity: std::sync::Arc<crate::transport::activity::SessionActivity>,
+        activity: std::sync::Arc<crate::io_activity::SessionActivity>,
     ) {
         self.idle.set_activity(activity);
     }

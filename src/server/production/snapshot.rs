@@ -111,7 +111,7 @@ impl RuntimeSnapshot {
                     &policy.warm_connections,
                 );
                 let address = canonical_listener_address(&config);
-                let io_timeout = crate::transport::activity::WRITE_STALL_TIMEOUT;
+                let io_timeout = crate::io_activity::WRITE_STALL_TIMEOUT;
                 let handler = match &landing.landing {
                     LandingProtocol::Nxr(settings) => {
                         let replay = listener_replays

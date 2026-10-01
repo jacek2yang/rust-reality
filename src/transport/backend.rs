@@ -323,7 +323,7 @@ pub enum BackendRequest {
 #[derive(Clone, Debug, Default)]
 pub struct RelayContext {
     /// Shared authenticated connection activity, if already established.
-    pub activity: Option<std::sync::Arc<super::activity::SessionActivity>>,
+    pub activity: Option<std::sync::Arc<crate::io_activity::SessionActivity>>,
     /// The backend the caller requested.
     pub request: BackendRequest,
     /// Idle write_stall bound for the raw relay.
@@ -353,7 +353,7 @@ impl RelayContext {
     #[must_use]
     pub fn with_activity(
         mut self,
-        activity: std::sync::Arc<super::activity::SessionActivity>,
+        activity: std::sync::Arc<crate::io_activity::SessionActivity>,
     ) -> Self {
         self.activity = Some(activity);
         self
@@ -410,7 +410,7 @@ impl RelayContext {
 #[derive(Clone, Debug, Default)]
 pub struct DirectionalRelayContext {
     /// Shared authenticated connection activity, if already established.
-    pub activity: Option<std::sync::Arc<super::activity::SessionActivity>>,
+    pub activity: Option<std::sync::Arc<crate::io_activity::SessionActivity>>,
     /// The backend the caller requested.
     pub request: BackendRequest,
     /// Maximum stalled write interval; a quiet source read is unbounded.
@@ -422,7 +422,7 @@ impl DirectionalRelayContext {
     #[must_use]
     pub fn with_activity(
         mut self,
-        activity: std::sync::Arc<super::activity::SessionActivity>,
+        activity: std::sync::Arc<crate::io_activity::SessionActivity>,
     ) -> Self {
         self.activity = Some(activity);
         self
@@ -460,7 +460,7 @@ impl DirectionalRelayContext {
 /// the ledger refuses to produce a decline once either counter is nonzero.
 #[derive(Debug, Default)]
 pub struct TransferLedger {
-    activity: Option<std::sync::Arc<super::activity::SessionActivity>>,
+    activity: Option<std::sync::Arc<crate::io_activity::SessionActivity>>,
     inbound_to_outbound: AtomicU64,
     outbound_to_inbound: AtomicU64,
     pipe_downgrade: std::sync::atomic::AtomicU64,
@@ -479,7 +479,7 @@ impl TransferLedger {
     }
 
     pub(super) fn with_activity(
-        activity: Option<std::sync::Arc<super::activity::SessionActivity>>,
+        activity: Option<std::sync::Arc<crate::io_activity::SessionActivity>>,
     ) -> Self {
         let activity = activity.unwrap_or_default();
         activity.enter_raw();
