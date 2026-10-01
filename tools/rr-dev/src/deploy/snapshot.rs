@@ -388,7 +388,10 @@ fn optional_readlink(
     let reply = transport.run(
         host,
         true,
-        &["readlink".to_owned(), "-f".to_owned(), path.to_owned()],
+        // -f permits a nonexistent final component: an unmanaged host whose
+        // /etc directory exists would appear to have a CURRENT config. Require
+        // the complete target to exist before reporting a generation pointer.
+        &["readlink".to_owned(), "-e".to_owned(), path.to_owned()],
     )?;
     if !reply.success() || reply.stdout.trim().is_empty() {
         return Ok(None);
@@ -553,10 +556,10 @@ mod tests {
                 "/opt/rust-reality/releases/r2/rust-reality --version" => "rust-reality 1.9.0\n",
                 "ss -ltnH" => "LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*\nLISTEN 0 4096 [::]:443 [::]:*\n",
                 "systemctl show rust-reality.service -p NRestarts --value" => "3\n",
-                "readlink -f /opt/rust-reality/current" => "/opt/rust-reality/releases/r2\n",
-                "readlink -f /etc/rust-reality/current" => "/etc/rust-reality/releases/r2\n",
-                "readlink -f /opt/rust-reality/previous" => "/opt/rust-reality/releases/r1\n",
-                "readlink -f /etc/rust-reality/previous" => "/etc/rust-reality/releases/r1\n",
+                "readlink -e /opt/rust-reality/current" => "/opt/rust-reality/releases/r2\n",
+                "readlink -e /etc/rust-reality/current" => "/etc/rust-reality/releases/r2\n",
+                "readlink -e /opt/rust-reality/previous" => "/opt/rust-reality/releases/r1\n",
+                "readlink -e /etc/rust-reality/previous" => "/etc/rust-reality/releases/r1\n",
                 _ => return Err(format!("unexpected fake command {joined}")),
             };
             Ok(Reply {
@@ -569,6 +572,64 @@ mod tests {
         fn copy_to(&mut self, _host: &Host, _local: &Path, _remote: &str) -> Result<(), String> {
             Err("copy is not part of read-only inspection".to_owned())
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_final_component_is_not_a_generation_pointer() {
+        struct LocalReadlink;
+        impl Transport for LocalReadlink {
+            fn dispatch(
+                &mut self,
+                _host: &Host,
+                privileged: bool,
+                argv: &[String],
+            ) -> Result<Reply, String> {
+                assert!(privileged);
+                assert_eq!(argv.first().map(String::as_str), Some("readlink"));
+                let output = std::process::Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                Ok(Reply {
+                    code: output.status.code(),
+                    stdout: String::from_utf8(output.stdout).unwrap(),
+                    stderr: String::from_utf8(output.stderr).unwrap(),
+                })
+            }
+
+            fn copy_to(
+                &mut self,
+                _host: &Host,
+                _local: &Path,
+                _remote: &str,
+            ) -> Result<(), String> {
+                panic!("inspection must never copy or mutate files")
+            }
+        }
+
+        // /proc/self exists; the named child cannot be an on-disk generation.
+        // This reproduces GNU readlink's actual behavior, without creating or
+        // deleting anything on the filesystem or contacting a remote host.
+        let missing = "/proc/self/rr-dev-nonexistent-generation";
+        let old = std::process::Command::new("readlink")
+            .args(["-f", missing])
+            .output()
+            .unwrap();
+        assert!(old.status.success());
+        assert!(!old.stdout.is_empty());
+
+        let topology = Topology::canonical().unwrap();
+        let host = topology.host(HostRole::Line);
+        assert_eq!(
+            optional_readlink(&mut LocalReadlink, host, missing).unwrap(),
+            None
+        );
+        assert!(
+            optional_readlink(&mut LocalReadlink, host, "/proc/self")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
