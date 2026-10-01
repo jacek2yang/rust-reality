@@ -1158,11 +1158,11 @@ mod tests {
                 "0\n".to_owned()
             } else if joined == "readlink -e /opt/rust-reality/current" {
                 format!("{}\n", self.current)
-            } else if joined == "readlink -f /etc/rust-reality/current" {
+            } else if joined == "readlink -e /etc/rust-reality/current" {
                 format!("{}\n", self.config_current)
             } else if joined == "readlink -e /opt/rust-reality/previous" {
                 format!("{}\n", self.previous)
-            } else if joined == "readlink -f /etc/rust-reality/previous" {
+            } else if joined == "readlink -e /etc/rust-reality/previous" {
                 format!("{}\n", self.config_previous)
             } else if let Some(root) = joined
                 .strip_prefix("find ")
