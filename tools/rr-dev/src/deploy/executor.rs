@@ -1156,11 +1156,11 @@ mod tests {
                 "LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*\nLISTEN 0 4096 [::]:443 [::]:*\n".to_owned()
             } else if joined == "systemctl show rust-reality.service -p NRestarts --value" {
                 "0\n".to_owned()
-            } else if joined == "readlink -f /opt/rust-reality/current" {
+            } else if joined == "readlink -e /opt/rust-reality/current" {
                 format!("{}\n", self.current)
             } else if joined == "readlink -f /etc/rust-reality/current" {
                 format!("{}\n", self.config_current)
-            } else if joined == "readlink -f /opt/rust-reality/previous" {
+            } else if joined == "readlink -e /opt/rust-reality/previous" {
                 format!("{}\n", self.previous)
             } else if joined == "readlink -f /etc/rust-reality/previous" {
                 format!("{}\n", self.config_previous)
