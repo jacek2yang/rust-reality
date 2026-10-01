@@ -184,6 +184,14 @@ pub struct TlsApplicationWriter<W> {
 }
 
 impl<R> TlsApplicationReader<R> {
+    /// Switches authenticated data reads to connection-wide activity.
+    pub(crate) fn set_activity(
+        &mut self,
+        activity: std::sync::Arc<crate::transport::activity::SessionActivity>,
+    ) {
+        self.idle.set_activity(activity);
+    }
+
     /// Consumes record state and returns unparsed buffered bytes plus the transport.
     ///
     /// This is only appropriate after an authenticated higher-level protocol has
@@ -222,6 +230,14 @@ impl<R> TlsApplicationReader<R> {
 }
 
 impl<W> TlsApplicationWriter<W> {
+    /// Attaches the same activity state as the peer read direction.
+    pub(crate) fn set_activity(
+        &mut self,
+        activity: std::sync::Arc<crate::transport::activity::SessionActivity>,
+    ) {
+        self.idle.set_activity(activity);
+    }
+
     /// Consumes the writer at a session-handoff boundary.
     ///
     /// Writes are record-synchronous, so the writer is always at a record
@@ -796,7 +812,7 @@ where
                 io::IoSliceMut::new(fourth),
             ];
             self.idle
-                .guard(reader.read_vectored(&mut buffers))
+                .read_operation(reader.read_vectored(&mut buffers))
                 .await
                 .map_err(idle_failure)?
         };

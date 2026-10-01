@@ -8,6 +8,13 @@ architecture, and what is reported at runtime. Measured evidence for the design
 lives in [performance.md](performance.md); the benchmark methodology and
 canonical samples live in [benchmarks.md](benchmarks.md).
 
+Authenticated asymmetric streams such as SSE and WebSocket are not terminated
+merely because one direction is idle. This lifecycle correction needs no
+configuration or client changes; existing LANDING.json, LINE.json and
+STANDALONE.json remain valid. `fallbackTimeoutMs` controls fallback lifetime,
+not authenticated inactivity. See [ADR 0030](../adr/0030-shared-authenticated-session-activity.md)
+for the observation and resource tradeoffs.
+
 ## Connection lifecycle
 
 1. **Accept.** The listener acquires an FD-budget permit *before* `accept(2)`
@@ -73,9 +80,12 @@ canonical samples live in [benchmarks.md](benchmarks.md).
      (one syscall per refill, not two per record); every byte buffered past a
      raw boundary is drained to the peer in order before any raw relay
      starts;
-   - one timer registration per progress step (`IdleDeadline`), never a fresh
-     `time::timeout` per chunk; idle semantics — progress resets the window,
-     so long transfers never hit a session cap;
+   - one shared activity flag for successful reads/writes in either direction,
+     sampled by one connection coordinator every five minutes; completely idle
+     framed sessions expire within two sampling windows, never because just
+     one direction is quiet;
+   - a separate 120-second pending-write stall deadline, reset after actual
+     partial-write progress; authenticated reads never reset or poll a timer;
    - the outer downlink reads destination bytes directly into the AEAD
      plaintext region and seals in place (one copy: the socket read);
    - raw-mode Vision records pass through as borrowed slices (no per-record
@@ -135,6 +145,11 @@ canonical samples live in [benchmarks.md](benchmarks.md).
    Every backend declines only before transferring its first byte and falls
    through the order above. A backend error after transfer starts terminates
    the relay; it is never replayed.
+   A Direct/raw transfer disables framed inactivity enforcement for the whole
+   connection, including a still-framed peer. Buffered and splice relays have
+   no read-idle deadline; the existing TCP keepalive detects dead peers and
+   admission/FD budgets bound occupancy. Healthy quiet raw connections have no
+   user-space lifetime cap. Pending writes remain stall-bounded.
 7. **Teardown.** Source EOF shuts down the destination write side in the same
    direction; the peer direction is unaffected. A raw-stage `BrokenPipe` or
    `ConnectionReset` (benign peer-teardown race) closes the direction cleanly

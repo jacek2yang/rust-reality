@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use crate::{
     logging::{LogEvent, Logger, RejectionReason},
     runtime::{AdmissionDenied, AdmissionPermit},
-    transport::{RelayBackend, tcp_relay::is_liveness_timeout_abort},
+    transport::{RelayBackend, tcp_relay::is_write_stall_timeout_abort},
 };
 
 use super::{
@@ -193,7 +193,9 @@ impl ConnectionRunError {
                 | HandoffLandingError::Session(_),
             ) => RejectionReason::Outbound,
             Self::Nxr(_) | Self::Handoff(_) => RejectionReason::Authentication,
-            Self::Vision(VisionSessionError::Relay(error)) if is_liveness_timeout_abort(error) => {
+            Self::Vision(VisionSessionError::Relay(error))
+                if is_write_stall_timeout_abort(error) =>
+            {
                 // A mid-transfer liveness kill is rewrapped as
                 // `ConnectionAborted` so a truncated transfer can never pass
                 // for a clean idle close, but the cause is the liveness

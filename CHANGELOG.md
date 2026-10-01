@@ -4,6 +4,20 @@ All notable user-facing changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [Unreleased]
+
+### Fixed
+
+- Authenticated long-lived asymmetric TCP sessions (including SSE, WebSocket,
+  gRPC streaming, long HTTP streams and SSH-like traffic) no longer terminate
+  merely because one direction is idle. Framed traffic shares connection
+  activity; raw buffered/splice traffic uses TCP lifetime and existing kernel
+  keepalive. Real FIN preserves the remaining direction, and blocked writes
+  retain an independent stall bound.
+- Existing configuration remains compatible: this is a binary-only upgrade.
+  No changes to LANDING.json, LINE.json, STANDALONE.json or clients are needed.
+  Fallback lifetime and authentication/handshake/connect deadlines are unchanged.
+
 ## [2.0.0] - 2026-09-08
 
 v2 finalizes the cryptographic boundary while retaining the VLESS + REALITY +
