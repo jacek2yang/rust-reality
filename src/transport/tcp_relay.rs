@@ -741,10 +741,10 @@ where
             Err(error) => return Err(error),
         };
         ledger.progress(read);
-        if let (Some(idle), Some(window)) = (&mut idle, write_stall) {
-            idle.reset(window).map_err(idle_io_error)?;
-        }
         if read == 0 {
+            if let (Some(idle), Some(window)) = (&mut idle, write_stall) {
+                idle.reset(window).map_err(idle_io_error)?;
+            }
             let shutdown = match &mut idle {
                 Some(idle) => idle.shutdown(&mut writer).await.map_err(idle_io_error),
                 None => writer.shutdown().await,

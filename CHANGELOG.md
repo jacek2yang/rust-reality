@@ -4,7 +4,7 @@ All notable user-facing changes to this project are documented in this file.
 
 ## [Unreleased]
 
-## [Unreleased]
+## [2.0.1]
 
 ### Fixed
 
