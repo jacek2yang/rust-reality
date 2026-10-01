@@ -22,6 +22,7 @@ pub mod cli;
 pub mod config;
 pub mod crypto;
 pub mod explain;
+pub mod io_activity;
 pub mod logging;
 pub mod network;
 pub mod protocol;

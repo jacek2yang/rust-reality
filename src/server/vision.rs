@@ -46,6 +46,7 @@ use super::{
 };
 use crate::config::node::entry::EntryConfig;
 use crate::config::node::routing::DomainStrategy;
+use crate::io_activity::{SESSION_IDLE_WINDOW, SessionActivity, WRITE_STALL_TIMEOUT};
 use crate::runtime::policy::EffectivePolicy;
 use crate::runtime::policy::ResourceGovernorPolicy;
 use crate::transport::{
@@ -332,7 +333,7 @@ impl VisionHandler {
             routing,
             relay,
             request_timeout: Duration::from_millis(governor.handshake_timeout_ms),
-            io_timeout: Duration::from_millis(governor.fallback_timeout_ms),
+            io_timeout: WRITE_STALL_TIMEOUT,
             dns_strategy,
             dns_timeout,
         }
@@ -411,7 +412,9 @@ impl VisionHandler {
         // One coordinator per session. It holds two atomics, four socket-half
         // slots, and a version watch; never a queue and never a payload.
         let handoff = DirectHandoff::new();
+        let activity = Arc::new(SessionActivity::default());
         let context = SessionContext {
+            activity: &activity,
             timeout: self.io_timeout,
             handoff: &handoff,
             relay: &self.relay,
@@ -431,7 +434,7 @@ impl VisionHandler {
             &response_header,
             &context,
         );
-        let (uplink, downlink) = tokio::try_join!(uplink, downlink)?;
+        let (uplink, downlink) = join_directions(uplink, downlink, &activity).await?;
         drop(outbound_permit);
         Ok(session_stats(uplink, downlink))
     }
@@ -555,7 +558,7 @@ impl VisionHandler {
                 // close semantics LANDING and the client enforce; a teardown
                 // reset from either side ends its direction like an EOF.
                 RelayContext::owned()
-                    .with_liveness(self.io_timeout)
+                    .with_write_stall(self.io_timeout)
                     .with_source_reset_as_eof(),
             )
             .await;
@@ -647,7 +650,9 @@ pub(crate) async fn run_resumed_session(
     let response_header = [crate::protocol::vless::VERSION, 0];
     let prefetched = 0..prefetched_plaintext.len();
     let handoff = DirectHandoff::new();
+    let activity = Arc::new(SessionActivity::default());
     let context = SessionContext {
+        activity: &activity,
         timeout,
         handoff: &handoff,
         relay,
@@ -667,8 +672,22 @@ pub(crate) async fn run_resumed_session(
         &response_header,
         &context,
     );
-    let (uplink, downlink) = tokio::try_join!(uplink, downlink)?;
+    let (uplink, downlink) = join_directions(uplink, downlink, &activity).await?;
     Ok(session_stats(uplink, downlink))
+}
+
+async fn join_directions(
+    uplink: impl std::future::Future<Output = Result<DirectionStats, VisionSessionError>>,
+    downlink: impl std::future::Future<Output = Result<DirectionStats, VisionSessionError>>,
+    activity: &SessionActivity,
+) -> Result<(DirectionStats, DirectionStats), VisionSessionError> {
+    // A real EOF completes only its direction. Errors still cancel the pair
+    // under the existing abort guards; quiet reads never manufacture an EOF.
+    tokio::select! {
+        biased;
+        result = async { tokio::try_join!(uplink, downlink) } => result,
+        () = activity.expired(SESSION_IDLE_WINDOW) => Err(VisionSessionError::Timeout),
+    }
 }
 
 async fn read_vision_request<R>(
@@ -805,6 +824,7 @@ impl DirectionStats {
 /// argument-count lint without hiding anything: the coordinator and the relay
 /// are borrowed, never cloned per connection.
 struct SessionContext<'session> {
+    activity: &'session Arc<SessionActivity>,
     timeout: Duration,
     handoff: &'session DirectHandoff,
     relay: &'session TcpRelay,
@@ -991,6 +1011,7 @@ async fn relay_uplink(
     prefetched: Range<usize>,
     context: &SessionContext<'_>,
 ) -> Result<DirectionStats, VisionSessionError> {
+    client.set_activity(Arc::clone(context.activity));
     let step = {
         let mut guard = DirectionAbortGuard::new(&mut client, &mut destination);
         let (client, destination) = guard.parts_mut();
@@ -1060,6 +1081,7 @@ async fn relay_uplink_framed(
         .try_reserve_exact(MAX_PLAINTEXT_LEN)
         .map_err(|_| VisionSessionError::AllocationFailed)?;
     let mut idle = IdleDeadline::new();
+    idle.set_activity(Arc::clone(context.activity));
     let mut bytes = 0_u64;
 
     // The prefetched payload is a borrowed range inside the retained request
@@ -1202,6 +1224,7 @@ async fn finish_uplink_direct(
     let (pending, raw_client) = client.into_inner_with_pending();
     if !pending.is_empty() {
         let mut idle = IdleDeadline::new();
+        idle.set_activity(Arc::clone(context.activity));
         idle.reset(timeout).map_err(idle_failure)?;
         idle.write_all(&mut destination, &pending)
             .await
@@ -1262,7 +1285,9 @@ async fn relay_downlink(
     response_header: &[u8],
     context: &SessionContext<'_>,
 ) -> Result<DirectionStats, VisionSessionError> {
+    client.set_activity(Arc::clone(context.activity));
     let mut nested = NestedRecordReader::new(destination);
+    nested.idle.set_activity(Arc::clone(context.activity));
     let step = {
         let mut guard = DirectionAbortGuard::new(&mut client, &mut nested);
         let (client, destination) = guard.parts_mut();
@@ -1526,6 +1551,7 @@ async fn finish_downlink_direct(
     let mut raw_client = client.into_inner();
     if !pending.is_empty() {
         let mut idle = IdleDeadline::new();
+        idle.set_activity(Arc::clone(context.activity));
         idle.reset(timeout).map_err(idle_failure)?;
         idle.write_all(&mut raw_client, &pending)
             .await
@@ -1591,7 +1617,7 @@ struct BoundaryBytes {
 /// A benign peer-teardown race (`BrokenPipe`, `ConnectionReset`, or the raw
 /// stage's idle-policy `TimedOut` on an untouched ledger) closes the
 /// direction cleanly with its accumulated stats instead of failing the whole
-/// session; a liveness timeout after bytes moved aborts both sockets and
+/// session; a write_stall timeout after bytes moved aborts both sockets and
 /// arrives as `ConnectionAborted`, failing the session. Errors from the
 /// framed and authentication phases never reach here.
 async fn run_directional(
@@ -1606,6 +1632,7 @@ async fn run_directional(
         timeout,
         handoff,
         relay,
+        ..
     } = *context;
     let delay_us = micros(handoff_started.elapsed());
     let relay_direction = match direction {
@@ -1617,7 +1644,9 @@ async fn run_directional(
             source,
             destination,
             relay_direction,
-            DirectionalRelayContext::owned_direction().with_liveness(timeout),
+            DirectionalRelayContext::owned_direction()
+                .with_write_stall(timeout)
+                .with_activity(Arc::clone(context.activity)),
         )
         .await
     {
@@ -1671,6 +1700,7 @@ async fn run_handoff(
         timeout,
         handoff,
         relay,
+        ..
     } = *context;
     let delay_us = micros(handoff_started.elapsed());
     let Some(sockets) = recovered else {
@@ -1687,7 +1717,9 @@ async fn run_handoff(
         .relay_owned(
             sockets.client,
             sockets.destination,
-            RelayContext::owned().with_liveness(timeout),
+            RelayContext::owned()
+                .with_write_stall(timeout)
+                .with_activity(Arc::clone(context.activity)),
         )
         .await
     {
@@ -1724,9 +1756,9 @@ async fn run_handoff(
 ///
 /// A reset or broken pipe once the raw relay owns the sockets means the peer
 /// tore the connection down mid-transfer. An idle `TimedOut` reaching here
-/// never moved a byte: the relay reclassifies a liveness timeout that
+/// never moved a byte: the relay reclassifies a write_stall timeout that
 /// truncated a live transfer as `ConnectionAborted` after resetting both
-/// sockets, so a `TimedOut` is always the relay's own liveness policy ending
+/// sockets, so a `TimedOut` is always the relay's own write_stall policy ending
 /// a stalled, untouched direction — a clean teardown from the session's
 /// perspective, never a transport failure. In all three cases the session's
 /// accumulated counts stay valid and must not be suppressed by a
@@ -1758,7 +1790,7 @@ fn settle(handoff: &DirectHandoff, direction: Direction, state: DirectionState) 
 /// [`PairRendezvous`] owns the policy — how many cooperative scheduling points
 /// may be spent and when to stop observing — and this function owns only the
 /// `yield_now` that the policy asks for. Never a sleep, a timer, or a wait on
-/// the peer, so no direction depends on its peer for liveness.
+/// the peer, so no direction depends on its peer for write_stall.
 ///
 /// The commit itself is the mutex-serialized [`DirectHandoff::decide`]: the peer
 /// read and the state transition are one critical section, so the two directions
@@ -2362,6 +2394,123 @@ mod tests {
     const USER: UserId = UserId::new([0x33; 16]);
 
     #[tokio::test(flavor = "current_thread")]
+    async fn resumed_framed_session_survives_both_asymmetries_and_sparse_alternation() {
+        let (mut client, inbound) = tcp_pair().await;
+        let (destination, mut target) = tcp_pair().await;
+        let (tls, mut client_write, mut client_read) = tls_states();
+        let (reader, writer) = TlsApplicationIo::new(inbound, tls).into_owned_split();
+        let relay = TcpRelay::new(TcpRelayConfig::for_test(), FdBudget::new(4_096)).expect("relay");
+        let mut encoder = VisionEncoder::with_padding_seed(USER, &[0x5a; 44]);
+        let mut initial = Vec::new();
+        encoder
+            .encode(b"request", VisionCommand::Continue, false, &mut initial)
+            .expect("initial frame");
+        let session = super::run_resumed_session(
+            reader,
+            writer,
+            destination,
+            USER,
+            initial,
+            &relay,
+            Duration::from_millis(20),
+        );
+        let traffic = async {
+            let mut request = [0; 7];
+            target.read_exact(&mut request).await?;
+            assert_eq!(&request, b"request");
+            let mut decoder = VisionDecoder::new(USER);
+            let mut first = true;
+            let mut decoded = Vec::new();
+            let mut wire = Vec::new();
+            for phase in 0..3 {
+                for tick in 0..8 {
+                    // The successful receive synchronizes each progress event.
+                    // One direction is silent for 120ms with a 20ms old window.
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    if phase == 1 || (phase == 2 && tick % 2 == 0) {
+                        let mut frame = Vec::new();
+                        encoder
+                            .encode(b"U", VisionCommand::Continue, false, &mut frame)
+                            .map_err(io::Error::other)?;
+                        wire.clear();
+                        client_write
+                            .seal_into(ContentType::ApplicationData, &frame, 0, &mut wire)
+                            .map_err(io::Error::other)?;
+                        client.write_all(&wire).await?;
+                        let mut byte = [0];
+                        target.read_exact(&mut byte).await?;
+                        assert_eq!(&byte, b"U");
+                    } else {
+                        // >=5 bytes lets the generic nested-TLS classifier
+                        // reject TLS immediately, without protocol detection.
+                        target.write_all(b"event").await?;
+                        let mut response = Vec::new();
+                        while response.len() < 5 {
+                            let mut record = read_tls_record(&mut client, TEST_TIMEOUT)
+                                .await
+                                .map_err(io::Error::other)?
+                                .into_wire();
+                            let opened = client_read
+                                .open_in_place(&mut record)
+                                .map_err(io::Error::other)?;
+                            let payload = if first {
+                                first = false;
+                                &opened.plaintext()[2..]
+                            } else {
+                                opened.plaintext()
+                            };
+                            decoder
+                                .decode(payload, &mut decoded)
+                                .map_err(io::Error::other)?;
+                            response.extend_from_slice(&decoded);
+                        }
+                        assert_eq!(response, b"event");
+                    }
+                }
+            }
+            wire.clear();
+            client_write
+                .seal_into(ContentType::Alert, &[1, 0], 0, &mut wire)
+                .map_err(io::Error::other)?;
+            client.write_all(&wire).await?;
+            assert_eq!(target.read(&mut [0]).await?, 0, "uplink FIN");
+            // A framed half-close also permits delayed downlink draining.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            target.write_all(b"tail!").await?;
+            target.shutdown().await?;
+            let mut tail = Vec::new();
+            loop {
+                let mut record = read_tls_record(&mut client, TEST_TIMEOUT)
+                    .await
+                    .map_err(io::Error::other)?
+                    .into_wire();
+                let opened = client_read
+                    .open_in_place(&mut record)
+                    .map_err(io::Error::other)?;
+                if opened.content_type() == ContentType::Alert {
+                    assert_eq!(opened.plaintext(), &[1, 0]);
+                    break;
+                }
+                decoder
+                    .decode(opened.plaintext(), &mut decoded)
+                    .map_err(io::Error::other)?;
+                tail.extend_from_slice(&decoded);
+            }
+            assert_eq!(tail, b"tail!");
+            Ok::<_, io::Error>(())
+        };
+        let (stats, traffic) = timeout(TEST_TIMEOUT, async { tokio::join!(session, traffic) })
+            .await
+            .expect("bounded regression");
+        traffic.expect("both directions remain byte-exact");
+        let stats = stats.expect("healthy asymmetric session");
+        assert_eq!(stats.uplink_bytes(), 19);
+        assert_eq!(stats.downlink_bytes(), 65);
+        assert!(!stats.uplink_direct());
+        assert!(!stats.downlink_direct());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn relays_non_tls_vision_session_inside_reality_records() {
         let destination_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2619,7 +2768,8 @@ mod tests {
             fallback_timeout_ms: 1_000,
             ..ResourceGovernorPolicy::default()
         };
-        let handler = direct_handler(&governor);
+        let mut handler = direct_handler(&governor);
+        handler.io_timeout = Duration::from_millis(20);
         let request = vision_request_with_command(
             destination_address.port(),
             b"up-framed",
@@ -2648,6 +2798,7 @@ mod tests {
                     )
                     .map_err(io::Error::other)?;
                 client.write_all(&request_record).await?;
+                tokio::time::sleep(Duration::from_millis(80)).await;
                 client.write_all(&raw).await?;
                 client.shutdown().await?;
 
@@ -2692,6 +2843,7 @@ mod tests {
                 // half-close left the peer direction fully operational.
                 let mut request = Vec::new();
                 destination.read_to_end(&mut request).await?;
+                tokio::time::sleep(Duration::from_millis(80)).await;
                 destination.write_all(downlink_part_two).await?;
                 destination.shutdown().await?;
                 Ok::<_, io::Error>(request)
@@ -4164,87 +4316,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn an_idle_raw_direction_closes_cleanly_with_its_stats() {
-        // The raw stage's idle policy ends a stalled direction that never
-        // moved a byte with TimedOut; the session must treat that like any
-        // other benign teardown — clean DirectionStats, never a session error.
+    async fn a_quiet_raw_direction_waits_for_fin_with_its_stats() {
         let relay = TcpRelay::new(TcpRelayConfig::for_test(), FdBudget::new(4_096))
             .expect("relay policy must compile");
         let handoff = DirectHandoff::new();
-        let (_sender, source) = tcp_pair().await;
-        let (sink, _receiver) = tcp_pair().await;
+        let activity = Arc::new(super::SessionActivity::default());
+        let (mut sender, source) = tcp_pair().await;
+        let (sink, mut receiver) = tcp_pair().await;
         let (source_reader, _source_writer) = source.into_split();
         let (_sink_reader, sink_writer) = sink.into_split();
-
-        let stats = timeout(
-            TEST_TIMEOUT,
-            run_directional(
-                &SessionContext {
-                    timeout: Duration::from_millis(200),
-                    handoff: &handoff,
-                    relay: &relay,
-                },
-                Direction::Uplink,
-                source_reader,
-                sink_writer,
-                BoundaryBytes {
-                    total: 3,
-                    direct_at: 3,
-                },
-                Instant::now(),
-            ),
-        )
-        .await
-        .expect("the idle direction must end within the test timeout")
-        .expect("an idle timeout on an untouched ledger must close cleanly");
+        let context = SessionContext {
+            activity: &activity,
+            timeout: Duration::from_millis(10),
+            handoff: &handoff,
+            relay: &relay,
+        };
+        let relaying = run_directional(
+            &context,
+            Direction::Uplink,
+            source_reader,
+            sink_writer,
+            BoundaryBytes {
+                total: 3,
+                direct_at: 3,
+            },
+            Instant::now(),
+        );
+        tokio::pin!(relaying);
+        assert!(
+            timeout(Duration::from_millis(50), &mut relaying)
+                .await
+                .is_err(),
+            "a quiet raw direction must remain open"
+        );
+        sender.shutdown().await.expect("FIN");
+        let stats = timeout(TEST_TIMEOUT, relaying)
+            .await
+            .expect("FIN deadline")
+            .expect("clean FIN");
+        assert_eq!(receiver.read(&mut [0]).await.expect("EOF"), 0);
         assert!(stats.direct);
         assert_eq!(stats.bytes, 3);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_liveness_timeout_after_moved_bytes_fails_the_session() {
-        // Once the raw relay moved bytes, a liveness timeout truncates the
-        // peer direction's tail: the relay resets both sockets and reports
-        // the abort as ConnectionAborted, so the session must fail rather
-        // than record a clean teardown.
+    async fn a_write_stall_after_moved_bytes_fails_the_session() {
         let relay = TcpRelay::new(TcpRelayConfig::for_test(), FdBudget::new(4_096))
             .expect("relay policy must compile");
         let handoff = DirectHandoff::new();
+        let activity = Arc::new(super::SessionActivity::default());
         let (mut sender, source) = tcp_pair().await;
         let (sink, _receiver) = tcp_pair().await;
         let (source_reader, _source_writer) = source.into_split();
         let (_sink_reader, sink_writer) = sink.into_split();
-        sender
-            .write_all(b"stall")
-            .await
-            .expect("the prefix must land");
-
-        let result = timeout(
-            TEST_TIMEOUT,
-            run_directional(
-                &SessionContext {
-                    timeout: Duration::from_millis(200),
-                    handoff: &handoff,
-                    relay: &relay,
-                },
-                Direction::Uplink,
-                source_reader,
-                sink_writer,
-                BoundaryBytes {
-                    total: 3,
-                    direct_at: 3,
-                },
-                Instant::now(),
-            ),
-        )
+        let context = SessionContext {
+            activity: &activity,
+            timeout: Duration::from_millis(50),
+            handoff: &handoff,
+            relay: &relay,
+        };
+        let result = timeout(TEST_TIMEOUT, async {
+            let mut flood = tokio::io::repeat(0x55);
+            tokio::select! {
+                result = run_directional(
+                    &context, Direction::Uplink, source_reader, sink_writer,
+                    BoundaryBytes { total: 3, direct_at: 3 }, Instant::now(),
+                ) => result,
+                result = tokio::io::copy(&mut flood, &mut sender) =>
+                    panic!("source must not finish before write stall: {result:?}"),
+            }
+        })
         .await
-        .expect("the stalled direction must end within the test timeout");
-        drop(sender);
-        let error = result
-            .err()
-            .expect("a timeout that truncated a live transfer must fail the session");
+        .expect("stalled write must be bounded");
+        let error = result.err().expect("write stall must fail closed");
         let VisionSessionError::Relay(source) = &error else {
-            panic!("the abort must surface as a relay error: {error}");
+            panic!("expected relay error: {error}");
         };
         assert_eq!(source.kind(), io::ErrorKind::ConnectionAborted);
     }

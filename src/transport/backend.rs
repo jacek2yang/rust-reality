@@ -320,19 +320,19 @@ pub enum BackendRequest {
 }
 
 /// Immutable per-relay context.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct RelayContext {
+    /// Shared authenticated connection activity, if already established.
+    pub activity: Option<std::sync::Arc<crate::io_activity::SessionActivity>>,
     /// The backend the caller requested.
     pub request: BackendRequest,
-    /// Idle liveness bound for the raw relay.
+    /// Idle write_stall bound for the raw relay.
     ///
-    /// When set, a direction that moves no byte for this long terminates the
-    /// relay instead of parking on a stalled peer forever, pinning its
-    /// descriptors, pipes, map entries and permits. `None` means unbounded,
-    /// which is what [`RelayContext::owned`] and its directional twin give a
-    /// caller that owns both halves and is therefore accountable for the
-    /// stall itself.
-    pub liveness: Option<std::time::Duration>,
+    /// Applies only while a write is pending, never to a quiet read.
+    /// `None` is for callers with their own lifetime bound, such as
+    /// unauthenticated cover fallback. Production authenticated callers
+    /// supply a write-stall bound independent of fallback policy.
+    pub write_stall: Option<std::time::Duration>,
     /// Whether a source reset ends its direction like an EOF.
     ///
     /// Default `false`: a reset mid-transfer is a true abort, so the peer
@@ -349,12 +349,23 @@ pub struct RelayContext {
 }
 
 impl RelayContext {
+    /// Carries session activity across a framed-to-raw ownership transfer.
+    #[must_use]
+    pub fn with_activity(
+        mut self,
+        activity: std::sync::Arc<crate::io_activity::SessionActivity>,
+    ) -> Self {
+        self.activity = Some(activity);
+        self
+    }
+
     /// Returns a context for a caller that owns both complete sockets.
     #[must_use]
     pub const fn owned() -> Self {
         Self {
             request: BackendRequest::Automatic,
-            liveness: None,
+            write_stall: None,
+            activity: None,
             source_reset_is_eof: false,
         }
     }
@@ -366,10 +377,10 @@ impl RelayContext {
         self
     }
 
-    /// Returns the same context with an idle liveness bound for the raw relay.
+    /// Returns the same context with a bound on stalled raw writes.
     #[must_use]
-    pub const fn with_liveness(mut self, liveness: std::time::Duration) -> Self {
-        self.liveness = Some(liveness);
+    pub const fn with_write_stall(mut self, write_stall: std::time::Duration) -> Self {
+        self.write_stall = Some(write_stall);
         self
     }
 
@@ -396,25 +407,34 @@ impl RelayContext {
 /// directional relay for an option it would drop on the floor. This mirrors how
 /// the Session Engine makes a retry after an irreversible write unrepresentable
 /// instead of guarding it at runtime.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DirectionalRelayContext {
+    /// Shared authenticated connection activity, if already established.
+    pub activity: Option<std::sync::Arc<crate::io_activity::SessionActivity>>,
     /// The backend the caller requested.
     pub request: BackendRequest,
-    /// Idle liveness bound for this direction.
-    ///
-    /// When set, a direction that moves no byte for this long terminates instead
-    /// of parking on a stalled peer forever, pinning its descriptors, pipes, map
-    /// entries and permits.
-    pub liveness: Option<Duration>,
+    /// Maximum stalled write interval; a quiet source read is unbounded.
+    pub write_stall: Option<Duration>,
 }
 
 impl DirectionalRelayContext {
+    /// Carries the same activity state as the other direction.
+    #[must_use]
+    pub fn with_activity(
+        mut self,
+        activity: std::sync::Arc<crate::io_activity::SessionActivity>,
+    ) -> Self {
+        self.activity = Some(activity);
+        self
+    }
+
     /// Returns a context for a caller that owns exactly one direction's halves.
     #[must_use]
     pub const fn owned_direction() -> Self {
         Self {
             request: BackendRequest::Automatic,
-            liveness: None,
+            write_stall: None,
+            activity: None,
         }
     }
 
@@ -425,10 +445,10 @@ impl DirectionalRelayContext {
         self
     }
 
-    /// Returns the same context with an idle liveness bound.
+    /// Returns the same context with a bound on stalled writes.
     #[must_use]
-    pub const fn with_liveness(mut self, liveness: Duration) -> Self {
-        self.liveness = Some(liveness);
+    pub const fn with_write_stall(mut self, write_stall: Duration) -> Self {
+        self.write_stall = Some(write_stall);
         self
     }
 }
@@ -440,6 +460,7 @@ impl DirectionalRelayContext {
 /// the ledger refuses to produce a decline once either counter is nonzero.
 #[derive(Debug, Default)]
 pub struct TransferLedger {
+    activity: Option<std::sync::Arc<crate::io_activity::SessionActivity>>,
     inbound_to_outbound: AtomicU64,
     outbound_to_inbound: AtomicU64,
     pipe_downgrade: std::sync::atomic::AtomicU64,
@@ -453,6 +474,26 @@ impl TransferLedger {
             inbound_to_outbound: AtomicU64::new(0),
             outbound_to_inbound: AtomicU64::new(0),
             pipe_downgrade: std::sync::atomic::AtomicU64::new(0),
+            activity: None,
+        }
+    }
+
+    pub(super) fn with_activity(
+        activity: Option<std::sync::Arc<crate::io_activity::SessionActivity>>,
+    ) -> Self {
+        let activity = activity.unwrap_or_default();
+        activity.enter_raw();
+        Self {
+            activity: Some(activity),
+            ..Self::new()
+        }
+    }
+
+    pub(super) fn progress(&self, bytes: usize) {
+        if bytes != 0
+            && let Some(activity) = &self.activity
+        {
+            activity.progress();
         }
     }
 

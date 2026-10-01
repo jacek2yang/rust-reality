@@ -1,9 +1,12 @@
-//! Reusable idle deadline for raw relay operations.
+//! Reusable write-stall deadline for raw relay operations.
+//!
+//! Never guard a raw read with this timer: inactivity in one direction says
+//! nothing about the health of its peer direction.
 
 use std::{io, pin::Pin, time::Duration};
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncWrite, AsyncWriteExt},
     time::{Instant, Sleep},
 };
 
@@ -46,22 +49,6 @@ impl RelayIdleDeadline {
             result = operation => result.map_err(RelayIdleError::Io),
             () = sleep => Err(RelayIdleError::Timeout),
         }
-    }
-
-    pub(super) async fn read<R: AsyncRead + Unpin>(
-        &mut self,
-        reader: &mut R,
-        output: &mut [u8],
-    ) -> Result<usize, RelayIdleError> {
-        self.guard(reader.read(output)).await
-    }
-
-    pub(super) async fn write_all<W: AsyncWrite + Unpin>(
-        &mut self,
-        writer: &mut W,
-        input: &[u8],
-    ) -> Result<(), RelayIdleError> {
-        self.guard(writer.write_all(input)).await
     }
 
     pub(super) async fn shutdown<W: AsyncWrite + Unpin>(

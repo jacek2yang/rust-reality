@@ -7,6 +7,12 @@ admission 架构和运行时可观测性。设计背后的实测证据见
 [performance.zh-CN.md](performance.md)；基准方法与规范样本见
 [benchmarks.zh-CN.md](benchmarks.md)。
 
+已认证的 SSE、WebSocket 等非对称长连接不会仅因一个方向空闲而被终止。
+此生命周期修复无需修改配置或客户端；现有 LANDING.json、LINE.json 和
+STANDALONE.json 保持有效。`fallbackTimeoutMs` 仍控制 fallback 生命周期，
+不控制已认证连接的空闲期限。观察机制与资源取舍见
+[ADR 0030](../adr/0030-shared-authenticated-session-activity.md)。
+
 ## 连接生命周期
 
 1. **Accept。** listener 在 `accept(2)` *之前*获取 FD 预算许可，并对 accept
@@ -55,9 +61,10 @@ admission 架构和运行时可观测性。设计背后的实测证据见
    - socket 读取每次最多向连接自有、只增不减的缓冲区补充 ≤64 KiB，完整记录
      在缓冲区中原地解析和解密（每次补充一次系统调用，而不是每条记录两次）；
      越过 raw 边界的每个缓冲字节在任何 raw relay 开始前按顺序排空到对端；
-   - 每个进度步只注册一次定时器（`IdleDeadline`），绝不对每个数据块新建
-     `time::timeout`；空闲语义——有进度就重置窗口，长传输永远不会触发会话
-     上限；
+   - 两个方向成功的读写共用一个活动标记，由一个连接级协调器每五分钟采样；
+     完全空闲的 framed 会话在两个采样窗口内回收，绝不只因一个方向安静而终止；
+   - 独立的 120 秒待写阻塞期限，只在实际部分写入推进后重置；
+     已认证读取不会重置或轮询定时器；
    - 外层下行把目标字节直接读入 AEAD 明文区域并原地 seal（只有一次拷贝：
      socket 读取）；
    - raw 模式的 Vision 记录以借用切片透传（没有每条记录 16 KiB 的 memcpy）；
@@ -106,6 +113,10 @@ admission 架构和运行时可观测性。设计背后的实测证据见
 
    每个后端只在移动第一个字节之前拒绝，并按上述顺序顺延。传输开始后发生的
    后端错误会终止 relay，绝不重放。
+   任一方向进入 Direct/raw 都会关闭整个连接的 framed 空闲期限，包括仍处于
+   framed 的对向。buffered 与 splice relay 均无读空闲期限；现有 TCP keepalive
+   检测死亡对端，admission/FD 预算限制资源占用。健康、安静的 raw 连接没有用户态
+   生命周期上限；待写操作仍受阻塞期限约束。
 7. **拆除。** 源端 EOF 按同方向关闭目标写端；对端方向不受影响。raw 阶段的
    `BrokenPipe` 或 `ConnectionReset`（良性的对端拆除竞态）会带着累计统计
    干净地关闭该方向，而不是把会话作为协议拒绝处理。

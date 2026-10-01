@@ -1,23 +1,21 @@
-//! One reusable idle deadline per connection direction.
+//! Reusable operation deadlines and authenticated activity observation.
 //!
-//! `tokio::time::timeout` builds and registers a fresh timer at every call, so
-//! a relay chunk paid that cost once for its read and again for its write.
-//! [`IdleDeadline`] keeps a single pinned `Sleep`: each progress step restarts
-//! the same timer, giving one timer registration per progress step and no
-//! per-operation timer construction at all.
-//!
-//! The semantics are an idle deadline, never a session-total cap: callers
-//! reset the window at each progress step, so a transfer making steady
-//! progress never times out while a stalled peer is bounded by the timeout.
+//! Before authentication, callers retain their original operation deadlines.
+//! Attaching session activity removes read-idle enforcement: either direction
+//! can keep the connection alive, including while a TLS record is incomplete.
+//! Writes still reuse one pinned timer, reset after each successful partial
+//! write. No timer is reset, allocated or polled for an authenticated read.
 
-use std::{fmt, io, pin::Pin, time::Duration};
+use std::{fmt, io, pin::Pin, sync::Arc, time::Duration};
+
+use crate::io_activity::SessionActivity;
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::{Instant, Sleep},
 };
 
-/// A reusable idle timeout shared by every operation of one direction.
+/// A reusable operation timeout, with optional shared session activity.
 ///
 /// The timer is created lazily on the first [`IdleDeadline::reset`], so the
 /// value can be constructed outside a runtime and stays allocation-free until
@@ -26,6 +24,8 @@ use tokio::{
 #[derive(Debug, Default)]
 pub struct IdleDeadline {
     sleep: Option<Pin<Box<Sleep>>>,
+    activity: Option<Arc<SessionActivity>>,
+    stall: Option<Duration>,
 }
 
 /// An operation guarded by an [`IdleDeadline`] failed.
@@ -59,20 +59,38 @@ impl IdleDeadline {
     /// Creates an unarmed idle deadline without touching the timer.
     #[must_use]
     pub const fn new() -> Self {
-        Self { sleep: None }
+        Self {
+            sleep: None,
+            activity: None,
+            stall: None,
+        }
+    }
+
+    /// Attaches authenticated session activity. Reads no longer have a
+    /// direction-local deadline; writes retain an independent stall bound.
+    pub(crate) fn set_activity(&mut self, activity: Arc<SessionActivity>) {
+        self.activity = Some(activity);
     }
 
     /// Restarts the idle window at the beginning of one progress step.
     ///
-    /// The first reset allocates the pinned timer; every later reset reuses
-    /// it, so a steady-state loop performs exactly one timer registration per
-    /// progress step.
+    /// Before session activity is attached this arms the timer immediately.
+    /// Afterwards it only sets the write-stall window; each actual write
+    /// attempt arms/reuses the timer, while reads report shared activity.
     ///
     /// # Errors
     ///
     /// Returns [`IdleError::Timeout`] when the deadline is not representable,
     /// matching the previous `Instant::now().checked_add(timeout)` behavior.
     pub fn reset(&mut self, timeout: Duration) -> Result<(), IdleError> {
+        self.stall = Some(timeout);
+        if self.activity.is_some() {
+            return Ok(());
+        }
+        self.arm(timeout)
+    }
+
+    fn arm(&mut self, timeout: Duration) -> Result<(), IdleError> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(IdleError::Timeout)?;
@@ -93,7 +111,13 @@ impl IdleDeadline {
     where
         R: AsyncRead + Unpin,
     {
-        self.guard(reader.read(output)).await
+        let read = if self.activity.is_some() {
+            reader.read(output).await.map_err(IdleError::Io)?
+        } else {
+            self.guard(reader.read(output)).await?
+        };
+        self.progress(read);
+        Ok(read)
     }
 
     /// Writes `input` completely within the current idle window.
@@ -106,7 +130,20 @@ impl IdleDeadline {
     where
         W: AsyncWrite + Unpin,
     {
-        self.guard(writer.write_all(input)).await
+        if self.activity.is_none() {
+            return self.guard(writer.write_all(input)).await;
+        }
+        let mut remaining = input;
+        while !remaining.is_empty() {
+            self.arm(self.stall.ok_or(IdleError::Timeout)?)?;
+            let written = self.guard(writer.write(remaining)).await?;
+            if written == 0 {
+                return Err(IdleError::Io(io::ErrorKind::WriteZero.into()));
+            }
+            self.progress(written);
+            remaining = &remaining[written..];
+        }
+        Ok(())
     }
 
     /// Shuts the writer down within the current idle window.
@@ -119,7 +156,31 @@ impl IdleDeadline {
     where
         W: AsyncWrite + Unpin,
     {
+        if self.activity.is_some() {
+            self.arm(self.stall.ok_or(IdleError::Timeout)?)?;
+        }
         self.guard(writer.shutdown()).await
+    }
+
+    pub(crate) fn progress(&self, bytes: usize) {
+        if bytes != 0
+            && let Some(activity) = &self.activity
+        {
+            activity.progress();
+        }
+    }
+
+    pub(crate) async fn read_operation<F>(&mut self, operation: F) -> Result<usize, IdleError>
+    where
+        F: std::future::Future<Output = io::Result<usize>>,
+    {
+        let read = if self.activity.is_some() {
+            operation.await.map_err(IdleError::Io)?
+        } else {
+            self.guard(operation).await?
+        };
+        self.progress(read);
+        Ok(read)
     }
 
     /// Polls one socket operation against the current idle window.

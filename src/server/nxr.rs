@@ -314,9 +314,8 @@ pub struct NxrLandingHandler {
     pressure: PressureGauge,
     generation: PreAuthGeneration,
     relay: TcpRelay,
-    /// Idle liveness bound handed to the raw relay, so a stalled peer cannot
-    /// park a landing session on its descriptors and permits forever.
-    liveness: Duration,
+    /// Pending-write stall bound. Quiet reads retain normal TCP lifetime.
+    write_stall: Duration,
 }
 
 impl NxrLandingHandler {
@@ -334,7 +333,7 @@ impl NxrLandingHandler {
         inbound: &NxrLandingConfig,
         replay: NxrReplayCache,
         relay: TcpRelay,
-        liveness: Duration,
+        write_stall: Duration,
         network: &NetworkConfig,
         network_environment: NetworkEnvironment,
         governor: ResourceGovernor,
@@ -359,7 +358,7 @@ impl NxrLandingHandler {
             Duration::from_millis(inbound.timing().connect_timeout_ms),
             Duration::from_millis(inbound.timing().authentication_timeout_ms),
             relay,
-            liveness,
+            write_stall,
         );
         handler.pre_auth_idle_timeout =
             Duration::from_millis(inbound.timing().pre_auth_idle_timeout_ms);
@@ -381,7 +380,7 @@ impl NxrLandingHandler {
         connect_timeout: Duration,
         authentication_timeout: Duration,
         relay: TcpRelay,
-        liveness: Duration,
+        write_stall: Duration,
     ) -> Self {
         let governor = ResourceGovernor::new(&ResourceGovernorPolicy::default());
         Self {
@@ -393,7 +392,7 @@ impl NxrLandingHandler {
             pressure: PressureGauge::new(),
             generation: PreAuthGeneration::default(),
             relay,
-            liveness,
+            write_stall,
         }
     }
 
@@ -437,14 +436,14 @@ impl NxrLandingHandler {
         let (outbound, _fd_permit) = connected.into_parts();
         // The landing handler owns both complete sockets, so every backend,
         // including those that must duplicate or register a descriptor, is
-        // eligible for this path. The liveness bound keeps a stalled peer from
-        // parking the relay forever.
+        // eligible for this path. Bound blocked writes without expiring a
+        // quiet direction or truncating the opposite direction after FIN.
         let outcome = self
             .relay
             .relay_owned(
                 inbound,
                 outbound,
-                RelayContext::owned().with_liveness(self.liveness),
+                RelayContext::owned().with_write_stall(self.write_stall),
             )
             .await
             .map_err(NxrLandingError::Relay)?;

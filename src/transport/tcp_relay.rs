@@ -170,7 +170,7 @@ impl TcpRelay {
     ///
     /// Returns allocation, socket, pipe, or shutdown errors. A backend error
     /// after transfer starts terminates the relay and is never replayed through
-    /// another backend. With `liveness` set, a direction that moves no byte for
+    /// another backend. With `write_stall` set, a direction that moves no byte for
     /// that long fails with [`io::ErrorKind::TimedOut`].
     pub async fn relay_direction(
         &self,
@@ -179,14 +179,18 @@ impl TcpRelay {
         direction: RelayDirection,
         context: DirectionalRelayContext,
     ) -> io::Result<DirectionalRelayOutcome> {
-        let DirectionalRelayContext { request, liveness } = context;
+        let DirectionalRelayContext {
+            request,
+            write_stall,
+            activity,
+        } = context;
         let order = directional_selection_order(request);
         let mut last_decline = BackendDeclineReason::Disabled;
         for backend in order {
-            let ledger = TransferLedger::new();
+            let ledger = TransferLedger::with_activity(activity.clone());
             let attempt = DirectionalAttempt {
                 direction,
-                liveness,
+                write_stall,
                 ledger: &ledger,
                 started: Instant::now(),
             };
@@ -234,14 +238,14 @@ impl TcpRelay {
     ) -> io::Result<BackendRun> {
         let DirectionalAttempt {
             direction,
-            liveness,
+            write_stall,
             ledger,
             started,
         } = *attempt;
         match backend {
             RelayBackend::Buffered => {
                 self.buffers
-                    .relay_direction(source, destination, direction, ledger, liveness)
+                    .relay_direction(source, destination, direction, ledger, write_stall)
                     .await?;
                 Ok(ledger.complete(RelayBackend::Buffered, started.elapsed()))
             }
@@ -261,7 +265,7 @@ impl TcpRelay {
     ) -> io::Result<BackendRun> {
         let DirectionalAttempt {
             direction,
-            liveness,
+            write_stall,
             ledger,
             started,
         } = *attempt;
@@ -269,7 +273,7 @@ impl TcpRelay {
             return ledger.decline(BackendDeclineReason::Disabled);
         };
         match splice
-            .try_relay_direction(source, destination, direction, ledger, liveness)
+            .try_relay_direction(source, destination, direction, ledger, write_stall)
             .await?
         {
             Some(()) => Ok(ledger.complete(RelayBackend::Splice, started.elapsed())),
@@ -298,10 +302,10 @@ impl TcpRelay {
         let order = selection_order(context.request);
         let mut last_decline = BackendDeclineReason::Disabled;
         for backend in order {
-            let ledger = TransferLedger::new();
+            let ledger = TransferLedger::with_activity(context.activity.clone());
             let started = Instant::now();
             let run = self
-                .run_backend(*backend, inbound, outbound, context, &ledger, started)
+                .run_backend(*backend, inbound, outbound, &context, &ledger, started)
                 .await;
             let run = match run {
                 Err(error) if !ledger.is_untouched() => {
@@ -328,7 +332,7 @@ impl TcpRelay {
         backend: RelayBackend,
         inbound: &mut TcpStream,
         outbound: &mut TcpStream,
-        context: RelayContext,
+        context: &RelayContext,
         ledger: &TransferLedger,
         started: Instant,
     ) -> io::Result<BackendRun> {
@@ -339,7 +343,7 @@ impl TcpRelay {
                         inbound,
                         outbound,
                         ledger,
-                        context.liveness,
+                        context.write_stall,
                         context.source_reset_is_eof,
                     )
                     .await?;
@@ -351,7 +355,7 @@ impl TcpRelay {
                     outbound,
                     ledger,
                     started,
-                    context.liveness,
+                    context.write_stall,
                     context.source_reset_is_eof,
                 )
                 .await
@@ -366,14 +370,14 @@ impl TcpRelay {
         outbound: &mut TcpStream,
         ledger: &TransferLedger,
         started: Instant,
-        liveness: Option<Duration>,
+        write_stall: Option<Duration>,
         source_reset_is_eof: bool,
     ) -> io::Result<BackendRun> {
         let Some(splice) = &self.splice else {
             return ledger.decline(BackendDeclineReason::Disabled);
         };
         match splice
-            .try_relay(inbound, outbound, ledger, liveness, source_reset_is_eof)
+            .try_relay(inbound, outbound, ledger, write_stall, source_reset_is_eof)
             .await?
         {
             Some(()) => Ok(ledger.complete(RelayBackend::Splice, started.elapsed())),
@@ -388,14 +392,14 @@ impl TcpRelay {
         _outbound: &mut TcpStream,
         ledger: &TransferLedger,
         _started: Instant,
-        _liveness: Option<Duration>,
+        _write_stall: Option<Duration>,
         _source_reset_is_eof: bool,
     ) -> io::Result<BackendRun> {
         ledger.decline(BackendDeclineReason::UnsupportedOperatingSystem)
     }
 }
 
-/// One directional backend attempt: the direction, its idle liveness bound,
+/// One directional backend attempt: the direction, its idle write_stall bound,
 /// the shared transfer ledger, and the attempt's start instant.
 ///
 /// Bundling these keeps the directional runners inside the repository's
@@ -403,7 +407,7 @@ impl TcpRelay {
 #[derive(Clone, Copy)]
 struct DirectionalAttempt<'a> {
     direction: RelayDirection,
-    liveness: Option<Duration>,
+    write_stall: Option<Duration>,
     ledger: &'a TransferLedger,
     started: Instant,
 }
@@ -429,7 +433,7 @@ fn directional_selection_order(request: BackendRequest) -> &'static [RelayBacken
     }
 }
 
-/// Reclassifies a liveness timeout that truncated a live transfer.
+/// Reclassifies a write_stall timeout that truncated a live transfer.
 ///
 /// An idle timeout before the first byte is a clean teardown, and callers may
 /// treat it as one. Once the ledger has moved bytes, the timeout aborts both
@@ -444,16 +448,16 @@ fn classify_abort(error: io::Error) -> io::Error {
     }
 }
 
-/// Returns whether an error is the mid-transfer liveness abort that
+/// Returns whether an error is the mid-transfer write_stall abort that
 /// `classify_abort` produces: `ConnectionAborted` carrying the original
 /// `TimedOut` as its payload.
 ///
 /// The rewrap exists so the session layer never mistakes a truncated transfer
-/// for a clean idle close, but the underlying cause is still the liveness
+/// for a clean idle close, but the underlying cause is still the write_stall
 /// policy, not a protocol violation — the session's rejection classification
 /// uses this to file the event as a timeout.
 #[must_use]
-pub fn is_liveness_timeout_abort(error: &io::Error) -> bool {
+pub fn is_write_stall_timeout_abort(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::ConnectionAborted
         && error
             .get_ref()
@@ -543,7 +547,7 @@ impl BufferPool {
         inbound: &mut TcpStream,
         outbound: &mut TcpStream,
         ledger: &TransferLedger,
-        liveness: Option<Duration>,
+        write_stall: Option<Duration>,
         source_reset_is_eof: bool,
     ) -> io::Result<()> {
         let mut pair = self.acquire_pair().await?;
@@ -556,7 +560,7 @@ impl BufferPool {
             inbound_buffer,
             ledger,
             true,
-            liveness,
+            write_stall,
             source_reset_is_eof,
         );
         let downlink = copy_direction(
@@ -565,7 +569,7 @@ impl BufferPool {
             outbound_buffer,
             ledger,
             false,
-            liveness,
+            write_stall,
             source_reset_is_eof,
         );
         tokio::try_join!(uplink, downlink)?;
@@ -579,7 +583,7 @@ impl BufferPool {
         destination: &mut OwnedWriteHalf,
         direction: RelayDirection,
         ledger: &TransferLedger,
-        liveness: Option<Duration>,
+        write_stall: Option<Duration>,
     ) -> io::Result<()> {
         let mut lease = self.acquire_single().await?;
         let buffer = lease.buffer_mut()?;
@@ -589,7 +593,7 @@ impl BufferPool {
             buffer,
             ledger,
             direction.is_inbound_to_outbound(),
-            liveness,
+            write_stall,
             false,
         )
         .await
@@ -704,7 +708,7 @@ impl Drop for PooledBuffer {
 /// The count is recorded only after the write completes, so a byte is never
 /// claimed as transferred before it actually reached the peer socket.
 ///
-/// With `liveness` set, one idle window is armed per chunk and shared by that
+/// With `write_stall` set, one idle window is armed per chunk and shared by that
 /// chunk's read and write: steady progress never times out, while a peer that
 /// stalls for the whole window ends the direction with
 /// [`io::ErrorKind::TimedOut`] instead of parking on its permit forever.
@@ -719,28 +723,28 @@ async fn copy_direction<R, W>(
     buffer: &mut [u8],
     ledger: &TransferLedger,
     inbound_to_outbound: bool,
-    liveness: Option<Duration>,
+    write_stall: Option<Duration>,
     source_reset_is_eof: bool,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut idle = liveness.map(|_| IdleDeadline::new());
+    let mut idle = write_stall.map(|_| IdleDeadline::new());
     loop {
-        let read = match (&mut idle, liveness) {
-            (Some(idle), Some(window)) => {
-                idle.reset(window).map_err(idle_io_error)?;
-                idle.read(&mut reader, buffer).await.map_err(idle_io_error)
-            }
-            _ => reader.read(buffer).await,
-        };
+        // Quiet reads are not stalled writes. TCP keepalive and peer FIN
+        // govern raw lifetime, including when only the other direction moves.
+        let read = reader.read(buffer).await;
         let read = match read {
             Ok(read) => read,
             Err(error) if source_reset_is_eof && is_peer_reset(&error) => 0,
             Err(error) => return Err(error),
         };
+        ledger.progress(read);
         if read == 0 {
+            if let (Some(idle), Some(window)) = (&mut idle, write_stall) {
+                idle.reset(window).map_err(idle_io_error)?;
+            }
             let shutdown = match &mut idle {
                 Some(idle) => idle.shutdown(&mut writer).await.map_err(idle_io_error),
                 None => writer.shutdown().await,
@@ -752,17 +756,25 @@ where
             }
             return Ok(());
         }
-        let payload = buffer
+        let mut payload = buffer
             .get(..read)
             .ok_or_else(|| io::Error::other("TCP relay read exceeded its buffer"))?;
-        match &mut idle {
-            Some(idle) => idle
-                .write_all(&mut writer, payload)
-                .await
-                .map_err(idle_io_error)?,
-            None => writer.write_all(payload).await?,
+        while !payload.is_empty() {
+            let written = match (&mut idle, write_stall) {
+                (Some(idle), Some(window)) => {
+                    idle.reset(window).map_err(idle_io_error)?;
+                    idle.guard(writer.write(payload))
+                        .await
+                        .map_err(idle_io_error)?
+                }
+                _ => writer.write(payload).await?,
+            };
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            record(ledger, inbound_to_outbound, written)?;
+            payload = &payload[written..];
         }
-        record(ledger, inbound_to_outbound, read)?;
     }
 }
 
@@ -789,6 +801,7 @@ fn idle_io_error(error: IdleError) -> io::Error {
 }
 
 fn record(ledger: &TransferLedger, inbound_to_outbound: bool, bytes: usize) -> io::Result<()> {
+    ledger.progress(bytes);
     let bytes = u64::try_from(bytes).map_err(|_| io::Error::other("relay byte count overflow"))?;
     if inbound_to_outbound {
         ledger.add_inbound_to_outbound(bytes)
@@ -961,7 +974,7 @@ impl SplicePool {
         inbound: &TcpStream,
         outbound: &TcpStream,
         ledger: &TransferLedger,
-        liveness: Option<Duration>,
+        write_stall: Option<Duration>,
         source_reset_is_eof: bool,
     ) -> io::Result<Option<()>> {
         let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
@@ -974,7 +987,7 @@ impl SplicePool {
                     inbound,
                     outbound,
                     ledger,
-                    liveness,
+                    write_stall,
                     source_reset_is_eof,
                 )
                 .await;
@@ -1001,7 +1014,7 @@ impl SplicePool {
             pipes.uplink.capacity(),
             ledger,
             true,
-            liveness,
+            write_stall,
             source_reset_is_eof,
         );
         let downlink = splice_direction(
@@ -1011,7 +1024,7 @@ impl SplicePool {
             pipes.downlink.capacity(),
             ledger,
             false,
-            liveness,
+            write_stall,
             source_reset_is_eof,
         );
         tokio::try_join!(uplink, downlink)?;
@@ -1026,7 +1039,7 @@ impl SplicePool {
         inbound: &TcpStream,
         outbound: &TcpStream,
         ledger: &TransferLedger,
-        liveness: Option<Duration>,
+        write_stall: Option<Duration>,
         source_reset_is_eof: bool,
     ) -> io::Result<Option<()>> {
         let Some(uplink_pipe) = pool.take() else {
@@ -1050,7 +1063,7 @@ impl SplicePool {
                 uplink_pipe.pair.capacity(),
                 ledger,
                 true,
-                liveness,
+                write_stall,
                 source_reset_is_eof,
             );
             let downlink = splice_direction(
@@ -1060,7 +1073,7 @@ impl SplicePool {
                 downlink_pipe.pair.capacity(),
                 ledger,
                 false,
-                liveness,
+                write_stall,
                 source_reset_is_eof,
             );
             tokio::try_join!(uplink, downlink)
@@ -1083,7 +1096,7 @@ impl SplicePool {
         destination: &mut OwnedWriteHalf,
         direction: RelayDirection,
         ledger: &TransferLedger,
-        liveness: Option<Duration>,
+        write_stall: Option<Duration>,
     ) -> io::Result<Option<()>> {
         let Ok(_permit) = Arc::clone(&self.permits).try_acquire_owned() else {
             return Ok(None);
@@ -1104,7 +1117,7 @@ impl SplicePool {
                 pipe.capacity(),
                 ledger,
                 direction.is_inbound_to_outbound(),
-                liveness,
+                write_stall,
             )
             .await;
             pool.give_back(pooled);
@@ -1134,7 +1147,7 @@ impl SplicePool {
             pipe.capacity(),
             ledger,
             direction.is_inbound_to_outbound(),
-            liveness,
+            write_stall,
         )
         .await?;
         Ok(Some(()))
@@ -1215,7 +1228,7 @@ async fn splice_direction(
     chunk_bytes: usize,
     ledger: &TransferLedger,
     inbound_to_outbound: bool,
-    liveness: Option<Duration>,
+    write_stall: Option<Duration>,
     source_reset_is_eof: bool,
 ) -> io::Result<()> {
     splice_pump(
@@ -1225,7 +1238,7 @@ async fn splice_direction(
         chunk_bytes,
         ledger,
         inbound_to_outbound,
-        liveness,
+        write_stall,
         source_reset_is_eof,
     )
     .await?;
@@ -1255,7 +1268,7 @@ async fn splice_owned_direction(
     chunk_bytes: usize,
     ledger: &TransferLedger,
     inbound_to_outbound: bool,
-    liveness: Option<Duration>,
+    write_stall: Option<Duration>,
 ) -> io::Result<()> {
     splice_pump(
         source.as_ref(),
@@ -1264,7 +1277,7 @@ async fn splice_owned_direction(
         chunk_bytes,
         ledger,
         inbound_to_outbound,
-        liveness,
+        write_stall,
         false,
     )
     .await?;
@@ -1276,7 +1289,7 @@ async fn splice_owned_direction(
 /// Every transferred byte is recorded in the shared ledger only after the
 /// destination accepted it, so a byte is never claimed before it moved.
 ///
-/// With `liveness` set, one idle window is armed per chunk and shared by that
+/// With `write_stall` set, one idle window is armed per chunk and shared by that
 /// chunk's splice-in and splice-out steps: steady progress never times out,
 /// while a stalled peer ends the direction with [`io::ErrorKind::TimedOut`]
 /// instead of parking on its pipes and permits forever. `None` keeps the
@@ -1296,33 +1309,19 @@ async fn splice_pump(
     chunk_bytes: usize,
     ledger: &TransferLedger,
     inbound_to_outbound: bool,
-    liveness: Option<Duration>,
+    write_stall: Option<Duration>,
     source_reset_is_eof: bool,
 ) -> io::Result<()> {
     use tokio::io::Interest;
 
-    let mut idle = liveness.map(|_| IdleDeadline::new());
+    let mut idle = write_stall.map(|_| IdleDeadline::new());
     loop {
-        if let (Some(idle), Some(window)) = (&mut idle, liveness) {
-            idle.reset(window).map_err(idle_io_error)?;
-        }
-        let read = match &mut idle {
-            Some(idle) => idle
-                .guard(source.async_io(Interest::READABLE, || {
-                    rr_linux::pipe::splice_nonblocking(source, pipe.write_fd(), chunk_bytes)
-                        .map_err(io::Error::from)
-                }))
-                .await
-                .map_err(idle_io_error),
-            None => {
-                source
-                    .async_io(Interest::READABLE, || {
-                        rr_linux::pipe::splice_nonblocking(source, pipe.write_fd(), chunk_bytes)
-                            .map_err(io::Error::from)
-                    })
-                    .await
-            }
-        };
+        let read = source
+            .async_io(Interest::READABLE, || {
+                rr_linux::pipe::splice_nonblocking(source, pipe.write_fd(), chunk_bytes)
+                    .map_err(io::Error::from)
+            })
+            .await;
         let read = match read {
             Ok(read) => read,
             Err(error) if source_reset_is_eof && is_peer_reset(&error) => return Ok(()),
@@ -1332,8 +1331,12 @@ async fn splice_pump(
             return Ok(());
         }
 
+        ledger.progress(read);
         let mut pending = read;
         while pending != 0 {
+            if let (Some(idle), Some(window)) = (&mut idle, write_stall) {
+                idle.reset(window).map_err(idle_io_error)?;
+            }
             let written = match &mut idle {
                 Some(idle) => idle
                     .guard(destination.async_io(Interest::WRITABLE, || {
@@ -1375,7 +1378,7 @@ mod tests {
 
     use super::{
         DirectionalRelayContext, FdBudget, TcpRelay, TcpRelayConfig, classify_abort,
-        is_liveness_timeout_abort,
+        is_write_stall_timeout_abort,
     };
     use crate::transport::{
         BackendRequest, DirectionalRelayOutcome, RelayBackend, RelayContext, RelayDirection,
@@ -2101,16 +2104,13 @@ mod tests {
         );
     }
 
-    /// Drives one directional relay against a peer that sends a prefix and
-    /// then stalls without ever closing, returning the relay's error.
-    ///
-    /// The prefix touches the transfer ledger, so the liveness timeout is a
-    /// true abort: RST on both sockets and `ConnectionAborted`, never the
-    /// clean `TimedOut` an untouched direction produces.
+    /// Fills the destination's TCP buffers without draining them. This is a
+    /// genuine write stall, not a quiet source. Partial transfer must still
+    /// fail closed and release all backend resources.
     async fn run_stalled_direction(
         relay: &TcpRelay,
         request: BackendRequest,
-        liveness: Duration,
+        write_stall: Duration,
     ) -> io::Error {
         let (mut sender, relay_source) = tcp_pair().await;
         let (relay_sink, _receiver) = tcp_pair().await;
@@ -2120,24 +2120,29 @@ mod tests {
             .write_all(b"partial")
             .await
             .expect("the prefix must land");
-        let outcome = time::timeout(
-            Duration::from_secs(2),
-            relay.relay_direction(
-                source_reader,
-                sink_writer,
-                RelayDirection::Uplink,
-                DirectionalRelayContext::owned_direction()
-                    .with_request(request)
-                    .with_liveness(liveness),
-            ),
-        )
+        let outcome = time::timeout(Duration::from_secs(2), async {
+            let mut flood = tokio::io::repeat(0x55);
+            tokio::select! {
+                result = relay.relay_direction(
+                    source_reader,
+                    sink_writer,
+                    RelayDirection::Uplink,
+                    DirectionalRelayContext::owned_direction()
+                        .with_request(request)
+                        .with_write_stall(write_stall),
+                ) => result,
+                result = tokio::io::copy(&mut flood, &mut sender) => {
+                    panic!("source must not finish before the write stall: {result:?}");
+                }
+            }
+        })
         .await
         .expect("a stalled peer must end the relay well within two seconds");
         drop(sender);
         outcome.expect_err("a stalled peer must fail the relay")
     }
 
-    /// Asserts that a mid-transfer liveness abort reports `ConnectionAborted`
+    /// Asserts that a mid-transfer write_stall abort reports `ConnectionAborted`
     /// while preserving the original `TimedOut` as its payload.
     fn assert_timeout_abort(error: &io::Error) {
         assert_eq!(
@@ -2153,67 +2158,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn an_idle_direction_without_any_byte_stays_a_clean_timeout() {
-        let relay = TcpRelay::new(
-            TcpRelayConfig {
-                buffer_bytes: 4 * 1024,
-                max_pooled_buffers: 2,
-                max_splice_relays: 0,
-                splice: false,
-                pipe_pool: true,
-                max_pooled_pipes: 8,
-            },
-            FdBudget::new(4_096),
-        )
-        .expect("relay policy must compile");
-        let (_sender, relay_source) = tcp_pair().await;
-        let (relay_sink, _receiver) = tcp_pair().await;
-        let (source_reader, _source_writer) = relay_source.into_split();
-        let (_sink_reader, sink_writer) = relay_sink.into_split();
-
-        let outcome = time::timeout(
-            Duration::from_secs(2),
-            relay.relay_direction(
-                source_reader,
-                sink_writer,
-                RelayDirection::Uplink,
-                DirectionalRelayContext::owned_direction()
-                    .with_request(BackendRequest::Explicit(RelayBackend::Buffered))
-                    .with_liveness(Duration::from_millis(200)),
-            ),
-        )
-        .await
-        .expect("an idle direction must end well within two seconds");
-        let error = outcome.expect_err("an idle direction must fail the relay");
-        assert_eq!(
-            error.kind(),
-            io::ErrorKind::TimedOut,
-            "an untouched ledger means nothing was truncated: the timeout stays clean"
-        );
-    }
-
-    #[test]
-    fn only_a_rewrapped_timeout_is_a_liveness_abort() {
-        let abort = classify_abort(io::Error::new(io::ErrorKind::TimedOut, "idle"));
-        assert!(is_liveness_timeout_abort(&abort));
-        assert!(!is_liveness_timeout_abort(&io::Error::new(
-            io::ErrorKind::TimedOut,
-            "an untouched-ledger timeout stays clean"
-        )));
-        assert!(!is_liveness_timeout_abort(&io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            "a peer abort without a timeout payload"
-        )));
-        assert!(!is_liveness_timeout_abort(&io::Error::other("boom")));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_paired_liveness_timeout_is_a_timeout_abort() {
-        // Bilateral relay: the uplink moves bytes while the downlink never
-        // sends anything. The shared ledger is non-untouched when the
-        // downlink idle guard trips, so the abort surfaces as
-        // ConnectionAborted carrying the original TimedOut — the exact shape
-        // the session layer must file as a timeout, not a protocol error.
+    async fn a_quiet_direction_waits_for_real_fin() {
         let relay = TcpRelay::new(
             TcpRelayConfig {
                 splice: false,
@@ -2222,36 +2167,110 @@ mod tests {
             FdBudget::new(4_096),
         )
         .expect("relay must build");
-        let (mut source_peer, relay_inbound) = tcp_pair().await;
-        let (relay_outbound, mut sink_peer) = tcp_pair().await;
-        source_peer
-            .write_all(b"prefix")
-            .await
-            .expect("the prefix must land");
-        let context = RelayContext::owned()
-            .with_request(BackendRequest::Explicit(RelayBackend::Buffered))
-            .with_liveness(Duration::from_millis(200));
-        let relaying = relay.relay_owned(relay_inbound, relay_outbound, context);
-        let drain = async {
-            let mut received = [0_u8; 6];
-            sink_peer
-                .read_exact(&mut received)
+        let (mut sender, relay_source) = tcp_pair().await;
+        let (relay_sink, mut receiver) = tcp_pair().await;
+        let (source_reader, _source_writer) = relay_source.into_split();
+        let (_sink_reader, sink_writer) = relay_sink.into_split();
+        let relaying = relay.relay_direction(
+            source_reader,
+            sink_writer,
+            RelayDirection::Uplink,
+            DirectionalRelayContext::owned_direction()
+                .with_request(BackendRequest::Explicit(RelayBackend::Buffered))
+                .with_write_stall(Duration::from_millis(10)),
+        );
+        tokio::pin!(relaying);
+        assert!(
+            time::timeout(Duration::from_millis(50), &mut relaying)
                 .await
-                .expect("the prefix must arrive");
-            assert_eq!(&received, b"prefix");
+                .is_err(),
+            "silence is not a FIN or an error"
+        );
+        sender.shutdown().await.expect("FIN");
+        let outcome = time::timeout(Duration::from_secs(2), relaying)
+            .await
+            .expect("FIN must finish")
+            .expect("clean FIN");
+        assert_eq!(outcome.bytes(), 0);
+        assert_eq!(receiver.read(&mut [0]).await.expect("EOF"), 0);
+    }
+
+    #[test]
+    fn only_a_rewrapped_timeout_is_a_write_stall_abort() {
+        let abort = classify_abort(io::Error::new(io::ErrorKind::TimedOut, "idle"));
+        assert!(is_write_stall_timeout_abort(&abort));
+        assert!(!is_write_stall_timeout_abort(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "an untouched-ledger timeout stays clean"
+        )));
+        assert!(!is_write_stall_timeout_abort(&io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "a peer abort without a timeout payload"
+        )));
+        assert!(!is_write_stall_timeout_abort(&io::Error::other("boom")));
+    }
+
+    async fn asymmetric_pair(backend: RelayBackend) {
+        let relay = TcpRelay::new(TcpRelayConfig::for_test(), FdBudget::new(4_096))
+            .expect("relay must build");
+        let (mut client, inbound) = tcp_pair().await;
+        let (outbound, mut server) = tcp_pair().await;
+        let context = RelayContext::owned()
+            .with_request(BackendRequest::Explicit(backend))
+            .with_write_stall(Duration::from_millis(20));
+        let traffic = async {
+            let mut byte = [0];
+            client.write_all(b"Q").await.expect("request");
+            server.read_exact(&mut byte).await.expect("request arrives");
+            assert_eq!(byte, *b"Q");
+            // SSE, reverse asymmetry, then alternating WebSocket-like messages.
+            // Each phase exceeds several old direction-idle windows. Each
+            // received byte synchronizes progress before advancing the phase.
+            for phase in 0..3 {
+                for tick in 0..8 {
+                    time::sleep(Duration::from_millis(15)).await;
+                    if phase == 1 || (phase == 2 && tick % 2 == 0) {
+                        client.write_all(b"U").await.expect("uplink");
+                        server.read_exact(&mut byte).await.expect("uplink arrives");
+                        assert_eq!(byte, *b"U");
+                    } else {
+                        server.write_all(b"D").await.expect("downlink");
+                        client
+                            .read_exact(&mut byte)
+                            .await
+                            .expect("downlink arrives");
+                        assert_eq!(byte, *b"D");
+                    }
+                }
+            }
+            // A FIN is different from silence; the opposite side still drains.
+            client.shutdown().await.expect("uplink FIN");
+            assert_eq!(server.read(&mut byte).await.expect("uplink EOF"), 0);
+            time::sleep(Duration::from_millis(80)).await;
+            server.write_all(b"T").await.expect("tail after FIN");
+            client.read_exact(&mut byte).await.expect("tail arrives");
+            assert_eq!(byte, *b"T");
+            server.shutdown().await.expect("downlink FIN");
+            assert_eq!(client.read(&mut byte).await.expect("downlink EOF"), 0);
         };
-        let (outcome, ()) = time::timeout(Duration::from_secs(2), async {
-            tokio::join!(relaying, drain)
+        let (outcome, ()) = time::timeout(Duration::from_secs(3), async {
+            tokio::join!(relay.relay_owned(inbound, outbound, context), traffic)
         })
         .await
-        .expect("a stalled direction must end the relay well within two seconds");
-        drop(source_peer);
-        let error = outcome.expect_err("a stalled direction must fail the paired relay");
-        assert_timeout_abort(&error);
-        assert!(
-            is_liveness_timeout_abort(&error),
-            "the session layer must be able to file the abort as a timeout"
-        );
+        .expect("asymmetric relay must finish");
+        let outcome = outcome.expect("quiet direction must never abort its peer");
+        assert_eq!(outcome.backend(), backend);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_asymmetry_and_half_close_preserve_both_directions() {
+        asymmetric_pair(RelayBackend::Buffered).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn splice_asymmetry_and_half_close_preserve_both_directions() {
+        asymmetric_pair(RelayBackend::Splice).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2310,11 +2329,11 @@ mod tests {
     }
 
     /// Drives one directional relay whose peer makes steady progress for
-    /// longer than three liveness windows, then half-closes.
+    /// longer than three write_stall windows, then half-closes.
     async fn run_active_direction(
         relay: &TcpRelay,
         request: BackendRequest,
-        liveness: Duration,
+        write_stall: Duration,
     ) -> (io::Result<DirectionalRelayOutcome>, Vec<u8>) {
         let (mut sender, relay_source) = tcp_pair().await;
         let (relay_sink, mut receiver) = tcp_pair().await;
@@ -2327,12 +2346,12 @@ mod tests {
                 RelayDirection::Uplink,
                 DirectionalRelayContext::owned_direction()
                     .with_request(request)
-                    .with_liveness(liveness),
+                    .with_write_stall(write_stall),
             );
             let sender_io = async {
                 for chunk in 0..8_u8 {
                     sender.write_all(&[chunk; 256]).await?;
-                    time::sleep(liveness / 2).await;
+                    time::sleep(write_stall / 2).await;
                 }
                 sender.shutdown().await?;
                 Ok::<_, io::Error>(())
@@ -2356,12 +2375,12 @@ mod tests {
     async fn an_active_directional_relay_never_times_out_across_many_windows() {
         let relay =
             TcpRelay::new(splice_policy(), FdBudget::new(4_096)).expect("relay must compile");
-        let liveness = Duration::from_millis(200);
+        let write_stall = Duration::from_millis(200);
         let expected: Vec<u8> = (0..8_u8).flat_map(|chunk| [chunk; 256]).collect();
 
         for backend in [RelayBackend::Splice, RelayBackend::Buffered] {
             let (outcome, received) =
-                run_active_direction(&relay, BackendRequest::Explicit(backend), liveness).await;
+                run_active_direction(&relay, BackendRequest::Explicit(backend), write_stall).await;
             let outcome = outcome.expect("steady progress must never time out");
             assert_eq!(received, expected, "{backend} bytes must arrive in order");
             assert_eq!(
@@ -2370,8 +2389,8 @@ mod tests {
             );
             assert_eq!(outcome.backend(), backend);
             assert!(
-                outcome.duration() > 3 * liveness,
-                "the transfer must span several liveness windows"
+                outcome.duration() > 3 * write_stall,
+                "the transfer must span several write_stall windows"
             );
         }
     }
