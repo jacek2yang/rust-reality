@@ -18,6 +18,11 @@ All notable user-facing changes to this project are documented in this file.
   No changes to LANDING.json, LINE.json, STANDALONE.json or clients are needed.
   Fallback lifetime and authentication/handshake/connect deadlines are unchanged.
 
+### Security
+
+- Update rustls to 0.23.45 (and its required webpki patch) in both lockfiles to
+  address RUSTSEC-2026-0285; all dependency audit gates remain enabled.
+
 ## [2.0.0] - 2026-09-08
 
 v2 finalizes the cryptographic boundary while retaining the VLESS + REALITY +
