@@ -345,3 +345,14 @@ sudo journalctl -u rust-reality -n 200 --no-pager
 
 `explain --json` contains no key material, so it is safe to share. The
 configuration file is not — it contains private keys.
+
+## Short initial origin responses
+
+An initial origin prefix that is already impossible as a TLS record header is
+forwarded immediately through Vision End/Outer, including one-to-four-byte
+ASCII replies such as `ack` and `pong`. The origin need not close its write side.
+Plausible incomplete TLS headers or record bodies still wait for classification;
+this fix does not establish arbitrary-byte-stream progress for those ambiguous
+prefixes. TLS Direct transitions remain tied to authenticated record boundaries.
+The `nested_tls_prefix` fuzz target covers the prefix predicate; socket tests
+cover response progress, half-close and fragmented-header cancellation.
