@@ -245,6 +245,11 @@ fn vision_rejection_reason(error: &VisionSessionError) -> RejectionReason {
             RejectionReason::ResourceLimit
         }
         VisionSessionError::Outbound(error) => outbound_rejection_reason(error),
+        VisionSessionError::Tls(error) => match super::failure::tls_cause(error).0 {
+            crate::logging::FailureCause::Timeout => RejectionReason::Timeout,
+            crate::logging::FailureCause::Allocation => RejectionReason::ResourceLimit,
+            _ => RejectionReason::Protocol,
+        },
         VisionSessionError::Relay(error)
         | VisionSessionError::HandoffLine(HandoffLineError::Relay(error))
             if is_write_stall_timeout_abort(error) =>

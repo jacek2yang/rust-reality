@@ -4,6 +4,7 @@ use std::io;
 
 use crate::{
     logging::{FailureCause as Cause, FailureDetail, FailureStage as Stage},
+    protocol::reality::tls13::{Tls13RecordError, TlsApplicationIoError, TlsRecordReadErrorKind},
     server::{
         connector::DestinationConnectError,
         handoff::{HandoffLandingError, HandoffLineError},
@@ -124,9 +125,26 @@ fn handoff(error: &HandoffLineError) -> CauseAndErrno {
     (cause, None)
 }
 
+pub(super) fn tls_cause(error: &TlsApplicationIoError) -> (Cause, Option<i32>) {
+    let cause = match error {
+        TlsApplicationIoError::Timeout => Cause::Timeout,
+        TlsApplicationIoError::Io(error) => return io_cause(error),
+        TlsApplicationIoError::Read(error) => match error.kind() {
+            TlsRecordReadErrorKind::Timeout => Cause::Timeout,
+            TlsRecordReadErrorKind::Io(error) => return io_cause(error),
+            TlsRecordReadErrorKind::UnexpectedEof => Cause::UnexpectedEof,
+            TlsRecordReadErrorKind::RecordTooLarge => Cause::Protocol,
+        },
+        TlsApplicationIoError::Record(Tls13RecordError::BufferAllocation) => Cause::Allocation,
+        _ => Cause::Protocol,
+    };
+    (cause, None)
+}
+
 fn session(error: &VisionSessionError) -> CauseAndErrno {
     let cause = match error {
         VisionSessionError::Outbound(error) => return outbound(error),
+        VisionSessionError::Tls(error) => return tls_cause(error),
         VisionSessionError::HandoffLine(error) => return handoff(error),
         VisionSessionError::Relay(error)
         | VisionSessionError::Io(error)
@@ -167,6 +185,77 @@ mod tests {
             assert!(!json.contains(secret));
             assert!(!json.contains("destination.example"));
             assert!(json.contains("landing_"));
+        }
+    }
+
+    #[test]
+    fn framed_session_errors_keep_typed_causes_without_retained_wire_bytes() {
+        use crate::protocol::reality::tls13::buffered_failure;
+        let secret = b"PRIVATE-WIRE-PREFIX";
+        let cases = [
+            (
+                TlsApplicationIoError::Timeout,
+                Cause::Timeout,
+                RejectionReason::Timeout,
+            ),
+            (
+                TlsApplicationIoError::Read(buffered_failure(
+                    TlsRecordReadErrorKind::Timeout,
+                    secret,
+                )),
+                Cause::Timeout,
+                RejectionReason::Timeout,
+            ),
+            (
+                TlsApplicationIoError::Record(Tls13RecordError::BufferAllocation),
+                Cause::Allocation,
+                RejectionReason::ResourceLimit,
+            ),
+            (
+                TlsApplicationIoError::Io(io::Error::from_raw_os_error(104)),
+                Cause::ConnectionReset,
+                RejectionReason::Protocol,
+            ),
+            (
+                TlsApplicationIoError::Read(buffered_failure(
+                    TlsRecordReadErrorKind::Io(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "PRIVATE-IO-TEXT",
+                    )),
+                    secret,
+                )),
+                Cause::ConnectionReset,
+                RejectionReason::Protocol,
+            ),
+            (
+                TlsApplicationIoError::Read(buffered_failure(
+                    TlsRecordReadErrorKind::UnexpectedEof,
+                    secret,
+                )),
+                Cause::UnexpectedEof,
+                RejectionReason::Protocol,
+            ),
+        ];
+        for (tls, cause, reason) in cases {
+            let error = ConnectionRunError::Handoff(HandoffLandingError::Session(
+                VisionSessionError::Tls(tls),
+            ));
+            let failure = detail(&error).expect("session detail");
+            assert_eq!(failure.stage, Stage::SessionRelay);
+            assert_eq!(failure.cause, cause);
+            assert_eq!(error.rejection_reason(), reason);
+            let json = serde_json::to_string(&failure).expect("serialize detail");
+            assert!(!json.contains("PRIVATE"));
+            // Serialization has a fixed three-field schema: there is no
+            // alternate numeric/escaped representation of retained bytes.
+            let value: serde_json::Value = serde_json::from_str(&json).expect("JSON detail");
+            assert!(
+                value
+                    .as_object()
+                    .expect("object")
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "stage" | "cause" | "errno"))
+            );
         }
     }
 
