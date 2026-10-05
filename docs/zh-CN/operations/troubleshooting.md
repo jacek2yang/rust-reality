@@ -294,6 +294,17 @@ sudo journalctl -u rust-reality -o cat | jq -c 'select(.level != "info")'
 `outbound`、`protocol`、`socket_configuration`。公网节点上的 `authentication` 属于
 正常背景噪声——那是扫描器产生的。
 
+认证后的出站失败还可以包含 `failure` 对象，提供固定词表的 `stage`、`cause`
+和可选的数字 `errno`。例如，`landing_destination` + `connection_refused` 表示
+LANDING 连接目标时被拒绝；`handoff_first_downlink` + `landing_rejected` 表示 LINE
+未收到有效的恢复会话 TLS 首字节。仅凭后者**无法**区分静默认证拒绝、目标连接失败
+或网络丢包。应结合两端时间戳排查，不要把两条不相关的 `outbound` 日志当成同一根因。
+这些字段不包含目标域名、出站标签、凭据、载荷或操作系统错误原文。
+
+LANDING 内嵌的 egress 准入/描述符失败仍归类为 `resource_limit`，会话/连接超时
+归类为 `timeout`。配置的 egress 发生准入拒绝时，还会输出已有的
+`admission_limited` 事件。这些分类用于区分本地限额和网络拒绝，不改变准入策略。
+
 把 `log.level` 设成 `debug` 可以看到每连接事件。它很吵，但那是能把一个连接的一生从头
 跟到尾的级别。
 

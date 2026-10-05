@@ -315,6 +315,21 @@ Useful ones:
 `outbound`, `protocol`, `socket_configuration`. `authentication` on a public
 node is ordinary background noise — it is what a scanner produces.
 
+Authenticated outbound failures can also carry a `failure` object with fixed
+`stage`, `cause`, and optional numeric `errno` fields. For example,
+`landing_destination` + `connection_refused` identifies a refused destination
+dial on LANDING; `handoff_first_downlink` + `landing_rejected` means LINE did not
+receive a valid resumed TLS byte. The latter alone does **not** distinguish a
+silent authentication rejection, destination failure, or lost network traffic.
+Correlate both nodes' timestamps; do not infer a shared cause from two unrelated
+`outbound` lines. The projection never includes destination names, outbound
+tags, credentials, payloads, or raw OS error messages.
+
+Nested LANDING egress admission/descriptor failures retain `resource_limit`,
+and session/dial deadlines retain `timeout`. A configured egress admission
+failure also emits the existing `admission_limited` event. These categories
+separate local limits from network refusal without changing admission policy.
+
 Set `log.level` to `debug` for per-connection events. It is verbose, and it is
 the level at which a single connection's life can be followed end to end.
 
