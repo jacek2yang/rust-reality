@@ -512,12 +512,8 @@ impl VisionHandler {
         // Reuniting consumes both client halves, so the landing descriptor —
         // which now exists and would otherwise leak a FIN — carries its own
         // guard across the only fallible step between the two phases.
-        let client_stream = {
-            let _landing_abort = SocketAbortGuard::new(&handoff_stream);
-            client_read_half
-                .reunite(client_write_half)
-                .map_err(|_| VisionSessionError::HandoffLine(HandoffLineError::Reunite))?
-        };
+        let client_stream =
+            reunite_handoff_client(client_read_half, client_write_half, &handoff_stream)?;
         // Classify the silent protocol's only failure signal before any socket
         // moves into the relay: no TLS downlink byte within the configured
         // first-byte deadline means rejection. Both guards borrow their
@@ -583,6 +579,23 @@ impl VisionHandler {
             ..VisionRelayStats::default()
         })
     }
+}
+
+/// Keeps the landing carrier abortable until client socket ownership is whole.
+fn reunite_handoff_client(
+    reader: OwnedReadHalf,
+    writer: OwnedWriteHalf,
+    landing: &TcpStream,
+) -> Result<TcpStream, VisionSessionError> {
+    let mut landing_abort = SocketAbortGuard::new(landing);
+    let client = reader
+        .reunite(writer)
+        .map_err(|_| VisionSessionError::HandoffLine(HandoffLineError::Reunite))?;
+    // A guard's Drop changes the kernel socket option permanently. Disarm
+    // this temporary guard before the first-downlink and relay guards take
+    // over, so successful sessions retain normal FIN/half-close semantics.
+    landing_abort.disarm();
+    Ok(client)
 }
 
 struct AcceptedVisionRequest {
@@ -2392,6 +2405,44 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
     const USER: UserId = UserId::new([0x33; 16]);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_handoff_reunite_preserves_graceful_carrier_close() {
+        let (client, _client_peer) = tcp_pair().await;
+        let (landing, mut landing_peer) = tcp_pair().await;
+        let (reader, writer) = client.into_split();
+        let _client = super::reunite_handoff_client(reader, writer, &landing)
+            .expect("matching client halves must reunite");
+        drop(landing);
+        let mut byte = [0_u8; 1];
+        let read = timeout(TEST_TIMEOUT, landing_peer.read(&mut byte))
+            .await
+            .expect("carrier close must be observable")
+            .expect("successful reunification must not arm an abortive carrier close");
+        assert_eq!(read, 0, "healthy carrier teardown must deliver FIN");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_handoff_reunite_still_aborts_carrier() {
+        let (first, _first_peer) = tcp_pair().await;
+        let (second, _second_peer) = tcp_pair().await;
+        let (landing, mut landing_peer) = tcp_pair().await;
+        let (reader, _first_writer) = first.into_split();
+        let (_second_reader, writer) = second.into_split();
+        let error = super::reunite_handoff_client(reader, writer, &landing)
+            .expect_err("unrelated client halves must fail closed");
+        assert!(matches!(
+            error,
+            VisionSessionError::HandoffLine(super::HandoffLineError::Reunite)
+        ));
+        drop(landing);
+        let mut byte = [0_u8; 1];
+        let error = timeout(TEST_TIMEOUT, landing_peer.read(&mut byte))
+            .await
+            .expect("carrier abort must be observable")
+            .expect_err("failed reunification must reset the carrier");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn resumed_framed_session_survives_both_asymmetries_and_sparse_alternation() {
