@@ -18,7 +18,10 @@ use tokio::{sync::watch, task::JoinError, time};
 
 use crate::{
     logging::{LogEvent, RejectionReason},
-    runtime::{AdmissionKind, ResourcePressure, connection::ConnectionTasks},
+    runtime::{
+        AdmissionKind, ResourcePressure,
+        connection::{ConnectionTaskResult, ConnectionTasks},
+    },
     transport::{
         FdPermit, UNITS_INBOUND_SOCKET,
         tcp::{AcceptBackoff, AcceptErrorClass, EmergencyDescriptor, TcpAcceptor},
@@ -269,11 +272,12 @@ fn admit_accepted_connection(
         }
     };
     emit_debug(&logger, || LogEvent::ConnectionAccepted { peer });
-    connections.spawn(peer, async move {
+    connections.spawn(async move {
         // Both permits move into the task and are released when it ends, on
         // every path including cancellation and abort.
         let _fd_permit = fd_permit;
-        run_connection(state, stream, peer, permit, &logger).await
+        let result = run_connection(state, stream, peer, permit, &logger).await;
+        ConnectionTaskResult::new(peer, result)
     });
 }
 
