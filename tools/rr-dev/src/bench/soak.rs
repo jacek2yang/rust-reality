@@ -2055,7 +2055,8 @@ fn run_round(
         ),
     ] {
         let output = workspace.join(&format!("round-{round}-{name}.bin"));
-        if fetch(&url, socks, insecure, &output, Some(expected_sha256)).is_err() {
+        let transfer = fetch(&url, socks, insecure, &output, Some(expected_sha256));
+        if finish_round_payload(&output, transfer).is_err() {
             failures += 1;
         }
     }
@@ -2066,6 +2067,18 @@ fn run_round(
         }
     }
     failures
+}
+
+/// Successful round bytes are reproducible from the retained origin payload;
+/// failed downloads must remain available for diagnosis.
+fn finish_round_payload(output: &Path, transfer: Result<(), String>) -> Result<(), String> {
+    transfer?;
+    std::fs::remove_file(output).map_err(|error| {
+        format!(
+            "could not remove verified round payload {}: {error}",
+            output.display()
+        )
+    })
 }
 
 fn fetch(
@@ -2710,6 +2723,45 @@ fn usize_json(value: usize) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_round_payloads_do_not_accumulate() {
+        let workspace = Workspace::create("soak-verified-payload-retention").unwrap();
+        let reference = workspace.join("origin-payload.bin");
+        std::fs::write(&reference, b"verified payload").unwrap();
+        for round in 0..128 {
+            for name in ["direct", "framed", "fallback"] {
+                let output = workspace.join(&format!("round-{round}-{name}.bin"));
+                std::fs::copy(&reference, &output).unwrap();
+                finish_round_payload(&output, Ok(())).unwrap();
+                assert!(!output.exists(), "verified round bytes must not accumulate");
+            }
+        }
+        assert_eq!(std::fs::read(&reference).unwrap(), b"verified payload");
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_round_payloads_preserve_bytes_and_original_error() {
+        let workspace = Workspace::create("soak-failed-payload-retention").unwrap();
+        let output = workspace.join("round-1-framed.bin");
+        std::fs::write(&output, b"truncated payload").unwrap();
+        let error = "payload SHA-256 mismatch".to_owned();
+        assert_eq!(
+            finish_round_payload(&output, Err(error.clone())),
+            Err(error)
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"truncated payload");
+    }
+
+    #[test]
+    fn verified_round_cleanup_errors_are_not_silently_accepted() {
+        let workspace = Workspace::create("soak-cleanup-error").unwrap();
+        let output = workspace.join("unexpected-directory");
+        std::fs::create_dir(&output).unwrap();
+        assert!(finish_round_payload(&output, Ok(())).is_err());
+        assert!(output.is_dir());
+    }
 
     fn plan() -> SoakPlan {
         SoakPlan {
