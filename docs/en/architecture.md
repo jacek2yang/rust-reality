@@ -523,3 +523,9 @@ A VLESS response contains a version and a length-prefixed Addons protobuf.
 Its second byte is not an error status. A valid header alone must not be used
 as proof that an arbitrary peer reached the destination. Route selection and
 application-byte commit policy remain above the wire codec.
+
+Client candidate ownership is defined by `rr-session::ClientRace` and driven by
+`runtime::client::select_client_transport`: at most two authentication attempts,
+one overall deadline, one selected transport, and no detached loser. Both
+candidates stop before destination requests. See [ADR 0032](../adr/0032-client-candidates-stop-before-destination-open.md).
+These primitives are not yet wired to a REALITY client handshake or local inbound.

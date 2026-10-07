@@ -401,3 +401,9 @@ VLESS 模块提供客户端侧的 `encode_vision_tcp_request` 与 `decode_respon
 VLESS 响应由版本和带长度前缀的 Addons protobuf 构成，第二个字节不是错误码。
 仅有合法响应头不能证明任意对端已连通目标。路由选择和应用数据提交策略
 仍由线格式层之上的逻辑负责。
+
+客户端候选所有权由 `rr-session::ClientRace` 定义，
+`runtime::client::select_client_transport` 驱动：最多两个认证尝试、一个总截止时间、
+唯一被选中的传输，落选任务不在后台继续运行。两个候选都必须停在目标请求之前。
+参见 [ADR 0032](../adr/0032-client-candidates-stop-before-destination-open.md)。
+这些基础能力尚未接入 REALITY 客户端握手或本地入站。
