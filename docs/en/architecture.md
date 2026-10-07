@@ -508,3 +508,18 @@ arrives, failures retain the ordinary closed-vocabulary rejection behavior and
 short authentication deadline.
 
 No event carries a target, an SNI value, a UUID, a key, or any payload.
+
+## Shared client wire boundary
+
+The VLESS module also exposes client-side `encode_vision_tcp_request` and
+`decode_response` over the same `UserId`, `Destination`, and Addons model as
+the server. These are allocation-free wire operations, not a client listener
+or an enabled client role. The caller owns buffers, connection establishment,
+deadlines, and cancellation. Request validation is atomic with respect to the
+output buffer; response parsing borrows the header and preserves all trailing
+application bytes.
+
+A VLESS response contains a version and a length-prefixed Addons protobuf.
+Its second byte is not an error status. A valid header alone must not be used
+as proof that an arbitrary peer reached the destination. Route selection and
+application-byte commit policy remain above the wire codec.
