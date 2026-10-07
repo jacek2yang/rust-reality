@@ -308,11 +308,34 @@ impl RuntimeStore {
 fn only_users_differ(current: &NodeConfig, candidate: &NodeConfig) -> bool {
     match (current, candidate) {
         (NodeConfig::Entry(current), NodeConfig::Entry(candidate)) => {
-            current.users != candidate.users && {
-                let mut aligned = candidate.clone();
-                aligned.users.clone_from(&current.users);
-                aligned == *current
-            }
+            // Exhaustive on purpose: a field added to `EntryConfig` fails to
+            // compile here until someone decides whether it is identity.
+            let crate::config::EntryConfig {
+                role,
+                listeners,
+                reality,
+                users,
+                outbounds,
+                routing,
+                assets,
+                dns,
+                network,
+                log,
+                runtime,
+                control,
+            } = &**current;
+            *users != candidate.users
+                && *role == candidate.role
+                && *listeners == candidate.listeners
+                && *reality == candidate.reality
+                && *outbounds == candidate.outbounds
+                && *routing == candidate.routing
+                && *assets == candidate.assets
+                && *dns == candidate.dns
+                && *network == candidate.network
+                && *log == candidate.log
+                && *runtime == candidate.runtime
+                && *control == candidate.control
         }
         _ => false,
     }
