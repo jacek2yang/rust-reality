@@ -173,6 +173,28 @@ With `"file"`, `log.file` is required, and `maxBytes`, `maxFiles`, and
 rejection and admission signal, so prefer a `level` filter unless logging
 itself is unacceptable.
 
+### Warm transport diagnostics
+
+When a configuration generation retires, `transport_pool_summary` (Handoff,
+NXR and SOCKS5) and `cover_pool_summary` report bounded aggregate observations.
+They are not a live metrics endpoint or a periodic health check.
+
+`pool_connect_failure` counts failed speculative TCP dials. The fixed reason
+counters `pool_connect_timeout`, `pool_connect_resource`, `pool_connect_policy`
+and `pool_connect_io` distinguish deadlines, explicit resource denials or
+allocation failures, address-policy rejection, and other I/O failures. They
+contain no endpoint, user label or error-message text. DNS failures that arrive
+as an unclassified I/O error remain in `pool_connect_io`; do not infer a more
+specific cause from that counter alone.
+
+`pool_failure_streak` and `pool_backoff_remaining_ms` describe the pool's current
+speculative retry state; the latter is rounded down to whole milliseconds.
+They return to zero when a successful connection is admitted to the ready
+pool. Cumulative reason counters remain until that pool generation is dropped.
+The backoff does not delay the ordinary cold connection path. Cancelled dials
+and successfully connected sockets discarded before admission are not dial
+failures. These observations do not prove peer health or change retry policy.
+
 ### Verify the start
 
 On every start, confirm in the journal:
