@@ -21,11 +21,16 @@ rust-reality 只提供这一通用接口。面板、机器人、计费、账户�
 
 启动时，在所有数据监听器绑定完成之后，服务器会：
 
-1. 删除上一个进程遗留在该路径上的旧*套接字*；若该路径上是其他任何类型的文件，则拒绝启动；
-2. 创建套接字并把权限设为 `0600`；
-3. 只接受 `SO_PEERCRED` uid 为套接字属主或 root 的对端。
+1. 打开套接字旁的 `<socket>.lock`（不存在时以权限 `0600` 创建，从不截断或删除），并在进程
+   整个生命周期内对它持有一个排他、非阻塞的 `flock`；若另一个进程持有该锁，启动失败，已有的
+   套接字保持原样；
+2. 在持有该锁的前提下，删除上一个进程遗留在该路径上的旧*套接字*；若该路径上是其他任何类型的
+   文件，则拒绝启动；
+3. 创建套接字并把权限设为 `0600`；
+4. 只接受 `SO_PEERCRED` uid 为套接字属主或 root 的对端。
 
-关闭时套接字会被删除。没有 TCP 监听，也没有能创建 TCP 监听的设置；需要远程访问时，请通过
+关闭时，只有当该路径仍指向本进程创建的那个套接字（设备号与 inode 相同）时才删除它；别人放在
+那里的文件保持原样。锁文件会保留，因此两个实例永远不会在删除并重建它时发生竞争。没有 TCP 监听，也没有能创建 TCP 监听的设置；需要远程访问时，请通过
 你自己的已认证通道（例如 SSH）到达该套接字。
 
 ## 分帧
@@ -71,13 +76,24 @@ REALITY 私钥，所有用户的句柄都会改变。
 UUID 是凭据。控制接口在 `users.create` 上接收一个（或生成一个），并且只在该响应中返回一次。
 任何列表、错误或日志行都不会包含 UUID。
 
-用户视图如下：
+`users.list` 与 `users.get` 返回的用户摘要如下：
 
 ```json
-{"handle":"u_…","label":"phone","policy":"split","enabled":true,"shortIds":["a1b2c3d4e5f60718"]}
+{"handle":"u_…","label":"phone","policy":"split","enabled":true,"shortIdCount":1}
 ```
 
-未设置时省略 `label` 和 `policy`。
+变更操作结果中的 `user` 是完整视图，用 `shortIds` 代替 `shortIdCount`。未设置时省略
+`label` 和 `policy`。
+
+## 列表
+
+`users.list` 与 `shortIds.list` 分页返回。它们接受 `limit`（1–1000，默认 100）和
+`cursor`，返回 `total`，在仍有条目时还返回 `nextCursor`。把 `nextCursor` 作为 `cursor`
+传回即可读取下一页。一页只包含完整的条目，编码后的条目达到 256 KiB 时停止增长，因此可能少于
+`limit` 条；只要还有剩余条目，一页至少包含一条。
+
+游标属于签发它的那一代。在另一代发布之后再出示它会得到 `cursorExpired`：请不带游标重新开始
+列举。因此一次列举绝不会由两代拼接而成。
 
 ## 操作
 
@@ -86,12 +102,12 @@ UUID 是凭据。控制接口在 `users.create` 上接收一个（或生成一�
 | `system.status` | — | `server`（`name`、`version`、`commit`）、`protocol`（`version`、`supported`）、`role`、`generation`、`capabilities`（操作名）、`limits` |
 | `generation.get` | — | `generation`、`origin`、`controlChanges` |
 | `config.reload` | — | 同 `generation.get`，针对新发布的一代 |
-| `users.list` | — | `users`：用户视图 |
-| `users.get` | `user` | `user` |
+| `users.list` | `cursor`?、`limit`? | `users`：用户摘要；`total`、`nextCursor`? |
+| `users.get` | `user` | `user`：用户摘要 |
 | `users.create` | `id`?、`shortIds`?、`label`?、`policy`?、`enabled`? | `user`、`id`（UUID，仅此一次） |
 | `users.setEnabled` | `user`、`enabled` | `user` |
 | `users.delete` | `user` | `handle` |
-| `shortIds.list` | `user`? | `shortIds`：`shortId`、`user`、`enabled` |
+| `shortIds.list` | `user`?、`cursor`?、`limit`? | `shortIds`：`shortId`、`user`、`enabled`；`total`、`nextCursor`? |
 | `shortIds.add` | `user`、`shortId` | `user` |
 | `shortIds.remove` | `user`、`shortId` | `user` |
 | `shortIds.rotate` | `user`、`retire`?、`bytes`? | `shortId`（新的那一条）、`user` |
@@ -104,6 +120,8 @@ UUID 是凭据。控制接口在 `users.create` 上接收一个（或生成一�
   新 short ID 并加入，同时在同一代中删除 `retire` 中的每一条（最多 16 条，且都必须属于该
   用户）。不带 `retire` 时旧 short ID 继续有效：先把新的分发给客户端，再用第二次调用删除旧的。
 - short ID 比较时不区分大小写，存储为小写。
+- 每个变更结果都带有 `changed`。结果与当前配置相同的变更（例如把用户的 `users.setEnabled`
+  设为它已有的状态）不会发布任何东西：`changed` 为 `false`，`generation` 为当前一代。
 
 ### 代的来源
 
@@ -120,6 +138,16 @@ UUID 是凭据。控制接口在 `users.create` 上接收一个（或生成一�
 3. 从*当前*配置派生恰好包含一处改动的候选；
 4. 用与配置文件完全相同的标准检查它：配置大小上限、完整语义校验、拒绝冷改动；
 5. 像 `SIGHUP` 重载那样编译并原子发布。
+
+只在 `users` 上与当前配置不同的候选会走更窄的编译：REALITY 认证器、它的 short ID 索引以及
+按 UUID 分组的路由表都从新用户重建，而已加载的地理资源、出站及其线路到落地的连接池、伪装回落
+及其连接池、伪装画像则沿用当前一代。因此用户管理从不读取或下载资源，也从不让预热池冷却。任何
+其他差异都走完整编译。
+
+资源刷新也是同样的事务：它重新编译持锁时的当前配置，因此绝不会撤销它等待期间发布的控制改动。
+
+服务器开始关闭时，会先关闭存储，再回收最后一代的连接池。此时仍在编译的事务以 `unavailable`
+失败，不发布任何东西。
 
 由此可得：
 
@@ -156,9 +184,10 @@ UUID 是凭据。控制接口在 `users.create` 上接收一个（或生成一�
 | `generationConflict` | `expectedGeneration` 不是当前一代。 |
 | `validationFailed` | 结果配置未通过校验；见 `error.path`。 |
 | `updateFailed` | 编译或发布失败，或文件重载被拒绝。 |
-| `unavailable` | 该操作需要本进程不具备的东西，例如 `config.reload` 需要配置文件。 |
+| `unavailable` | 该操作需要本进程不具备的东西，例如 `config.reload` 需要配置文件；或服务器正在关闭。 |
 | `requestTooLarge` | 请求行超过 64 KiB；连接被关闭。 |
 | `busy` | 所有控制连接都在使用中；连接被关闭。 |
+| `cursorExpired` | 列表的 `cursor` 属于已被替换的一代；请重新开始列举。 |
 | `internal` | 内部不变量失败；没有任何改动。 |
 
 ## 上限
@@ -169,12 +198,18 @@ UUID 是凭据。控制接口在 `users.create` 上接收一个（或生成一�
 | 请求 `id` | 128 字节 |
 | 并发连接 | 8 |
 | 每连接在途请求 | 1 |
+| 所有连接同时执行工作的请求 | 2 |
+| 列表页 | 1000 条，条目共 256 KiB |
 | 两次请求之间的空闲时间 | 60 s |
 | 停滞的响应写入 | 10 s |
 | 错误消息 | 4 KiB |
 | 结果配置 | 4 MiB，与任何配置文件的上限相同 |
 
-`system.status` 在 `limits` 下报告请求、连接和空闲上限。
+除 `system.status` 和 `generation.get` 外，所有操作都在阻塞线程池上运行，绝不在承载代理流量
+的线程上运行；所有连接合计同时最多运行两个，其余的排队等候。句柄每一代只派生一次，并被该代的
+每次读取复用。
+
+`system.status` 在 `limits` 下报告请求、连接、工作、分页和空闲上限。
 
 ## 事件
 

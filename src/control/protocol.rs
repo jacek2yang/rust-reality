@@ -51,6 +51,17 @@ pub const MAX_LABEL_BYTES: usize = 128;
 /// Largest number of short IDs one rotation may retire.
 pub const MAX_RETIRE: usize = 16;
 
+/// Entries a listing returns when the request names no `limit`.
+pub const DEFAULT_PAGE_LIMIT: usize = 100;
+
+/// Most entries one listing page may return.
+pub const MAX_PAGE_LIMIT: usize = 1_000;
+
+/// Encoded size a listing page stops growing at. A page holds whole
+/// entries, at least one, so a response is bounded by this budget or, for a
+/// single oversized entry, by the configuration size limit.
+pub const MAX_PAGE_BYTES: usize = 256 * 1024;
+
 /// A closed error vocabulary. Clients branch on the code, never on the
 /// message, which is human-oriented and may change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -81,8 +92,11 @@ pub enum ErrorCode {
     Unavailable,
     /// The request line exceeds [`MAX_REQUEST_BYTES`].
     RequestTooLarge,
-    /// The control endpoint is at its connection limit.
+    /// The control endpoint is at its connection or work limit.
     Busy,
+    /// A listing `cursor` belongs to a generation that is no longer current;
+    /// restart the listing without one.
+    CursorExpired,
     /// An internal invariant failed; the live generation is unchanged.
     Internal,
 }
@@ -108,7 +122,7 @@ pub enum Operation {
     /// `config.reload`: re-read the configuration file, exactly like `SIGHUP`.
     ConfigReload,
     /// `users.list`.
-    UsersList,
+    UsersList(PageArgs),
     /// `users.get`.
     UsersGet(UserArgs),
     /// `users.create`.
@@ -152,7 +166,7 @@ impl Operation {
             Self::SystemStatus => "system.status",
             Self::GenerationGet => "generation.get",
             Self::ConfigReload => "config.reload",
-            Self::UsersList => "users.list",
+            Self::UsersList(_) => "users.list",
             Self::UsersGet(_) => "users.get",
             Self::UsersCreate(_) => "users.create",
             Self::UsersSetEnabled(_) => "users.setEnabled",
@@ -221,6 +235,19 @@ pub struct SetEnabledArgs {
     pub enabled: bool,
 }
 
+/// Paging arguments of a listing.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PageArgs {
+    /// The `nextCursor` of the previous page. Absent starts at the first entry.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Most entries to return, 1 to [`MAX_PAGE_LIMIT`]. Absent means
+    /// [`DEFAULT_PAGE_LIMIT`].
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Arguments of `shortIds.list`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -228,6 +255,12 @@ pub struct ListShortIdsArgs {
     /// Restrict the listing to one user's short IDs.
     #[serde(default)]
     pub user: Option<String>,
+    /// The `nextCursor` of the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Most entries to return, 1 to [`MAX_PAGE_LIMIT`].
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// Arguments naming one short ID of one user.
@@ -404,7 +437,7 @@ fn decode_operation(op: &str, args: Value) -> Result<Operation, (ErrorCode, Stri
         "system.status" => none(op, &args).map(|()| Operation::SystemStatus)?,
         "generation.get" => none(op, &args).map(|()| Operation::GenerationGet)?,
         "config.reload" => none(op, &args).map(|()| Operation::ConfigReload)?,
-        "users.list" => none(op, &args).map(|()| Operation::UsersList)?,
+        "users.list" => Operation::UsersList(typed(op, args)?),
         "users.get" => Operation::UsersGet(typed(op, args)?),
         "users.create" => Operation::UsersCreate(typed(op, args)?),
         "users.setEnabled" => Operation::UsersSetEnabled(typed(op, args)?),

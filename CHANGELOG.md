@@ -15,7 +15,11 @@ All notable user-facing changes to this project are documented in this file.
   `expectedGeneration` makes it compare-and-publish. Users are addressed by a
   non-secret handle and UUIDs are returned only once, on creation. Control
   changes are not written to the configuration file, and a reload replaces
-  them. There is no network listener. See `docs/en/operations/control-api.md`.
+  them. Listings are paged, control work is bounded and kept off proxy worker
+  threads, a change that alters only users reuses the live generation's
+  assets and warm pools, and a change that alters nothing publishes nothing.
+  The socket is guarded by a lock file, so two instances cannot share a path.
+  There is no network listener. See `docs/en/operations/control-api.md`.
 - `users[].enabled` (absent means `true`). A disabled user keeps its short IDs
   reserved but cannot authenticate new connections. At least one user must
   stay enabled.

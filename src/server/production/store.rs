@@ -56,7 +56,30 @@ pub(super) struct RuntimeStore {
     pub(super) pressure: PressureGauge,
     pub(super) memory: Option<MemoryWatch>,
     pub(super) generation: AtomicU64,
+    /// Serializes whole update transactions (derive, validate, compile,
+    /// commit). Held for a compile, exactly as a `SIGHUP` reload holds it.
     pub(super) update: Mutex<()>,
+    /// The commit boundary: guards the instant a compiled candidate becomes
+    /// current, and whether the store still accepts publications at all.
+    /// Held only for that pointer swap and for pool activation, never for a
+    /// compile, so shutdown waits microseconds rather than a whole compile.
+    pub(super) commit: Mutex<CommitState>,
+}
+
+/// Whether the store still accepts publications.
+#[derive(Debug, Default)]
+pub(super) struct CommitState {
+    closed: bool,
+}
+
+/// The result of one update transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Published {
+    /// The generation current when the transaction ended.
+    pub(super) generation: u64,
+    /// Whether the transaction published a new generation. A control change
+    /// that leaves the configuration exactly as it was publishes nothing.
+    pub(super) changed: bool,
 }
 
 /// Admission authorities built once at startup and shared by every generation.
@@ -93,9 +116,50 @@ impl RuntimeStore {
         self.publish_as(GenerationOrigin::Configuration, config.into_node())
     }
 
+    /// Recompiles the live configuration with freshly loaded assets.
+    ///
+    /// The configuration is taken from the generation that is current *under
+    /// the update lock*, never from a copy read before it: a control change
+    /// published while this refresh waited for the lock is the base it
+    /// refreshes, not a change it silently reverts.
     pub(super) fn refresh(&self) -> Result<u64, RuntimeUpdateError> {
-        let node = self.load().node.clone();
-        self.publish_as(GenerationOrigin::Assets, node)
+        self.publish_derived(GenerationOrigin::Assets, None, |current| {
+            Ok::<_, RuntimeUpdateError>((current.node.clone(), ()))
+        })
+        .map(|(published, ())| published.generation)
+    }
+
+    /// Stops accepting publications and returns the final generation.
+    ///
+    /// Waits only for a commit already in progress (a pointer swap), never
+    /// for a compile. A transaction still compiling when this returns fails
+    /// with [`RuntimeUpdateError::ShuttingDown`] at its commit boundary, so
+    /// the generation returned here is the last one that will ever be
+    /// current and the caller may retire its pools without a racing
+    /// publication activating new ones.
+    pub(super) fn close(&self) -> Arc<RuntimeSnapshot> {
+        let mut commit = self
+            .commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        commit.closed = true;
+        self.load()
+    }
+
+    /// Starts speculative dialing for the current generation, unless the
+    /// store has closed.
+    ///
+    /// Runs under the commit boundary so it cannot interleave with
+    /// [`Self::close`]: either the pools start before shutdown retires them,
+    /// or they never start.
+    pub(super) fn activate_current(&self) {
+        let commit = self
+            .commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !commit.closed {
+            self.load().activate_warm_pools();
+        }
     }
 
     #[cfg(test)]
@@ -109,7 +173,7 @@ impl RuntimeStore {
         config: NodeConfig,
     ) -> Result<u64, RuntimeUpdateError> {
         self.publish_derived(origin, None, |_| Ok::<_, RuntimeUpdateError>((config, ())))
-            .map(|(generation, ())| generation)
+            .map(|(published, ())| published.generation)
     }
 
     /// Derives one candidate from the live generation and publishes it, as a
@@ -120,12 +184,19 @@ impl RuntimeStore {
     /// generation and silently discard each other's change. `expected` turns
     /// the transaction into compare-and-publish: when it no longer names the
     /// current generation, nothing is derived and nothing changes.
+    ///
+    /// A control change whose candidate equals the live configuration
+    /// publishes nothing and reports the current generation. A control change
+    /// that alters only `users` reuses the live generation's assets,
+    /// outbounds, cover fallback, and warm pools (see
+    /// [`RuntimeSnapshot::compile_identity`]); every other change compiles a
+    /// complete generation.
     pub(super) fn publish_derived<T, E>(
         &self,
         origin: GenerationOrigin,
         expected: Option<u64>,
         derive: impl FnOnce(&RuntimeSnapshot) -> Result<(NodeConfig, T), E>,
-    ) -> Result<(u64, T), E>
+    ) -> Result<(Published, T), E>
     where
         E: From<RuntimeUpdateError>,
     {
@@ -144,6 +215,15 @@ impl RuntimeStore {
             .into());
         }
         let (config, output) = derive(&current)?;
+        if origin == GenerationOrigin::Control && config == current.node {
+            return Ok((
+                Published {
+                    generation: current.generation,
+                    changed: false,
+                },
+                output,
+            ));
+        }
         let config = ensure_hot_compatible(&current, config)?;
         let generation = self
             .generation
@@ -161,25 +241,46 @@ impl RuntimeStore {
                 GenerationOrigin::Control => true,
             },
         };
-        let candidate = RuntimeSnapshot::compile(
-            config,
-            &self.policy,
-            generation,
-            provenance,
-            self.replay.clone(),
-            &self.listener_replays,
-            self.tcp_relay.clone(),
-            &self.pressure,
-            &self.authorities,
-        )?;
-        self.current.store(Arc::new(candidate));
-        self.generation.store(generation, Ordering::Release);
+        let identity_only =
+            origin == GenerationOrigin::Control && only_users_differ(&current.node, &config);
+        let candidate = if identity_only {
+            RuntimeSnapshot::compile_identity(&current, config, generation, provenance)?
+        } else {
+            RuntimeSnapshot::compile(
+                config,
+                &self.policy,
+                generation,
+                provenance,
+                self.replay.clone(),
+                &self.listener_replays,
+                self.tcp_relay.clone(),
+                &self.pressure,
+                &self.authorities,
+            )?
+        };
+        {
+            let commit = self
+                .commit
+                .lock()
+                .map_err(|_| RuntimeUpdateError::Unavailable)?;
+            if commit.closed {
+                return Err(RuntimeUpdateError::ShuttingDown.into());
+            }
+            self.current.store(Arc::new(candidate));
+            self.generation.store(generation, Ordering::Release);
+        }
         // Publish first so an accept racing this update can only observe a
         // live old generation or the new one, never a retired handler. The old
         // snapshot remains locally owned here while its unused speculative
         // sockets are reclaimed immediately afterwards; checked-out sessions
-        // retain their independent stream and permits.
-        current.deactivate_warm_pools();
+        // retain their independent stream and permits. An identity-only
+        // generation shares the old one's pools, so only its pre-auth
+        // generation retires.
+        if identity_only {
+            current.pre_auth_generation.deactivate();
+        } else {
+            current.deactivate_warm_pools();
+        }
         let published = self.load();
         emit(
             &published.logger,
@@ -187,7 +288,33 @@ impl RuntimeStore {
                 generation: published.generation,
             },
         );
-        Ok((generation, output))
+        Ok((
+            Published {
+                generation,
+                changed: true,
+            },
+            output,
+        ))
+    }
+}
+
+/// Whether `candidate` differs from `current` in the entry's `users` and in
+/// nothing else.
+///
+/// Users decide who authenticates and which routing policy applies; nothing
+/// that dials, listens, loads assets, or keeps a pool depends on them. Every
+/// other difference — including any change to the REALITY section, the
+/// routing rules, or the outbounds — takes the full compile.
+fn only_users_differ(current: &NodeConfig, candidate: &NodeConfig) -> bool {
+    match (current, candidate) {
+        (NodeConfig::Entry(current), NodeConfig::Entry(candidate)) => {
+            current.users != candidate.users && {
+                let mut aligned = candidate.clone();
+                aligned.users.clone_from(&current.users);
+                aligned == *current
+            }
+        }
+        _ => false,
     }
 }
 
@@ -195,6 +322,7 @@ impl RuntimeStore {
 mod tests {
     use std::sync::{Arc, atomic::Ordering};
 
+    use super::{GenerationOrigin, Published, RuntimeStore};
     use crate::{
         runtime::AdmissionKind,
         server::production::{
@@ -203,6 +331,7 @@ mod tests {
                 cold_variant, entry_config, only_listener, outbounds_of, tiny_ceiling_config,
                 unused_loopback_port, with_extra_outbound, with_extra_rule,
             },
+            snapshot::{ConnectionHandler, RuntimeSnapshot},
         },
     };
 
@@ -379,6 +508,197 @@ mod tests {
             "retiring the old generation must not deactivate the published one, or a \
              reload would strand every subsequent pre-auth connection"
         );
+    }
+
+    /// Runs a control-origin transaction on another thread whose derive step
+    /// (which holds the update lock) parks until released, and reports when it
+    /// is parked. Gives a test a deterministic "a mutation holds the lock" point.
+    fn parked_control_publication(
+        runtime: &Arc<RuntimeStore>,
+        candidate: crate::config::NodeConfig,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<Result<Published, RuntimeUpdateError>>,
+    ) {
+        let (locked_sender, locked) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let runtime = Arc::clone(runtime);
+        let thread = std::thread::spawn(move || {
+            runtime
+                .publish_derived(GenerationOrigin::Control, None, move |_| {
+                    locked_sender.send(()).expect("the test is waiting");
+                    released.recv().expect("the test releases the derive step");
+                    Ok::<_, RuntimeUpdateError>((candidate, ()))
+                })
+                .map(|(published, ())| published)
+        });
+        (locked, release, thread)
+    }
+
+    #[test]
+    fn an_asset_refresh_never_reverts_a_control_change_it_waited_behind() {
+        let port = unused_loopback_port();
+        let server = ProductionServer::from_config(entry_config(port)).expect("server");
+        let runtime = &server.runtime;
+        let changed = with_extra_outbound(port, "control-made");
+
+        // G1 is being derived under the update lock.
+        let (locked, release, control) = parked_control_publication(runtime, changed.clone());
+        locked
+            .recv()
+            .expect("the control derive step holds the lock");
+
+        // A refresh starts while G1 is in flight. Whatever it reads before
+        // it reaches the lock, the base it publishes must be G1.
+        let refresher = {
+            let runtime = Arc::clone(runtime);
+            std::thread::spawn(move || runtime.refresh())
+        };
+        // Give a refresh that (incorrectly) read its base before locking the
+        // chance to do so; the outcome asserted below holds for any schedule.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        release.send(()).expect("release the control derive step");
+
+        let control = control
+            .join()
+            .expect("control thread")
+            .expect("G1 publishes");
+        let refreshed = refresher
+            .join()
+            .expect("refresh thread")
+            .expect("G2 publishes");
+        assert_eq!((control.generation, refreshed), (1, 2));
+
+        let live = runtime.load();
+        assert_eq!(live.generation, 2);
+        assert_eq!(
+            live.node, changed,
+            "the refresh must recompile the control change, not the generation it replaced"
+        );
+        assert_eq!(live.provenance.origin, GenerationOrigin::Assets);
+        assert!(live.provenance.control_changes);
+        assert!(outbounds_of(&only_listener(&live)).contains("control-made"));
+    }
+
+    #[test]
+    fn closing_the_store_refuses_a_publication_still_compiling() {
+        let port = unused_loopback_port();
+        let server = ProductionServer::from_config(entry_config(port)).expect("server");
+        let runtime = &server.runtime;
+
+        let (locked, release, control) =
+            parked_control_publication(runtime, with_extra_outbound(port, "late"));
+        locked
+            .recv()
+            .expect("the derive step holds the update lock");
+
+        // Shutdown begins mid-transaction. Closing must not wait for the
+        // compile (the commit lock is free), and the generation it returns is
+        // the last one that will ever be current.
+        let last = runtime.close();
+        assert_eq!(last.generation, 0);
+        release.send(()).expect("release");
+
+        assert!(matches!(
+            control.join().expect("control thread"),
+            Err(RuntimeUpdateError::ShuttingDown)
+        ));
+        assert!(Arc::ptr_eq(&last, &runtime.load()));
+        assert_eq!(runtime.generation.load(Ordering::Acquire), 0);
+        assert!(
+            last.pre_auth_generation.is_active(),
+            "a refused commit must not retire the live generation"
+        );
+        assert!(matches!(
+            runtime.refresh(),
+            Err(RuntimeUpdateError::ShuttingDown)
+        ));
+    }
+
+    #[test]
+    fn a_control_change_that_changes_nothing_publishes_nothing() {
+        let server =
+            ProductionServer::from_config(entry_config(unused_loopback_port())).expect("server");
+        let before = server.runtime.load();
+        let (published, ()) = server
+            .runtime
+            .publish_derived(GenerationOrigin::Control, Some(0), |current| {
+                Ok::<_, RuntimeUpdateError>((current.node.clone(), ()))
+            })
+            .expect("a no-op is not an error");
+        assert_eq!(
+            published,
+            Published {
+                generation: 0,
+                changed: false
+            }
+        );
+        assert!(Arc::ptr_eq(&before, &server.runtime.load()));
+        assert!(before.pre_auth_generation.is_active());
+    }
+
+    #[test]
+    fn a_users_only_change_reuses_assets_and_pools_and_recompiles_identity() {
+        let port = unused_loopback_port();
+        let server = ProductionServer::from_config(entry_config(port)).expect("server");
+        let runtime = &server.runtime;
+        let previous = runtime.load();
+        let mut candidate = previous.node.clone();
+        if let crate::config::NodeConfig::Entry(entry) = &mut candidate {
+            entry.users[0].enabled = Some(false);
+            let mut extra = entry.users[0].clone();
+            extra.id = crate::config::node::fixture::uuid(0x22);
+            extra.short_ids = vec!["5a5a".to_owned()];
+            extra.enabled = None;
+            entry.users.push(extra);
+        }
+        let (published, ()) = runtime
+            .publish_derived(GenerationOrigin::Control, None, |_| {
+                Ok::<_, RuntimeUpdateError>((candidate.clone(), ()))
+            })
+            .expect("a users-only change publishes");
+        assert!(published.changed);
+        let live = runtime.load();
+        assert_eq!(live.node, candidate);
+
+        let same_assets = |a: &RuntimeSnapshot, b: &RuntimeSnapshot| match (&a.assets, &b.assets) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        assert!(
+            same_assets(&previous, &live),
+            "no asset is loaded again for an identity change"
+        );
+        let cover_generation = |snapshot: &RuntimeSnapshot| match &only_listener(snapshot).handler {
+            ConnectionHandler::Public { reality, .. } => {
+                reality.cover_pool_snapshot().map(|pool| pool.generation)
+            }
+            _ => None,
+        };
+        assert_eq!(
+            cover_generation(&previous),
+            Some(0),
+            "the fixture keeps a warm cover pool"
+        );
+        assert_eq!(
+            cover_generation(&live),
+            Some(0),
+            "the cover pool is taken over, not rebuilt cold"
+        );
+        assert!(!previous.pre_auth_generation.is_active());
+        assert!(live.pre_auth_generation.is_active());
+
+        // Any change beyond users takes the full compile.
+        let (full, ()) = runtime
+            .publish_derived(GenerationOrigin::Control, None, |_| {
+                Ok::<_, RuntimeUpdateError>((with_extra_outbound(port, "beyond-users"), ()))
+            })
+            .expect("a hot change publishes");
+        assert!(full.changed);
+        let rebuilt = runtime.load();
+        assert!(!same_assets(&live, &rebuilt));
+        assert_eq!(cover_generation(&rebuilt), Some(full.generation));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -28,10 +28,16 @@ may and may not change.
 ### Boundary
 
 An entry node may declare `control.socket`, an absolute path. Absent means no
-control interface exists. When present, the server creates one Unix domain
-socket there after every data listener has bound, sets it to mode `0600`,
-records its owning uid, and additionally refuses a connection whose
-`SO_PEERCRED` uid is neither that owner nor root. There is no TCP listener,
+control interface exists. When present, the server first takes an exclusive
+`flock` on `<socket>.lock` (held for the process lifetime, never removed), so
+a second instance configured with the same path fails instead of unlinking a
+live socket. Holding the lock, it removes a stale socket, creates one Unix
+domain socket there after every data listener has bound, sets it to mode
+`0600`, records its owning uid and inode, and additionally refuses a
+connection whose `SO_PEERCRED` uid is neither that owner nor root. Shutdown
+unlinks the path only while it still names that inode. A connect probe was
+rejected for exclusion: probing and then unlinking is itself a check/unlink
+race. There is no TCP listener,
 no configuration field that could create one, and no default path. The path is
 cold: rebinding it on reload would race connected controllers.
 
@@ -74,6 +80,49 @@ is compiled and published by the code path `SIGHUP` uses. Consequently:
 The compile runs on the blocking pool, as `SIGHUP` reloads already do, because
 it may read cached assets from disk.
 
+### Publication cost
+
+A control candidate equal to the live configuration publishes nothing and
+answers with the current generation (`changed: false`). A candidate that
+differs only in `users` is compiled narrowly: the authenticator, its short-ID
+index, and the UUID-grouped routing table are rebuilt; the loaded assets,
+outbound registry and its pools, cover fallback and its pool, cover profiles,
+certificate identity, and logger are carried over. None of the carried-over
+components holds per-user state, and the replay cache and admission
+authorities were already process-lifetime, so authentication, replay safety,
+and existing-session ownership are unchanged: a session still keeps the
+generation it was accepted under, and a new generation still denies a removed
+or disabled user immediately. Every other difference, and every file reload
+or asset refresh, takes the full compile. Pool reuse is limited to this case
+deliberately — a full compile may change a cover, an outbound, or a dial
+policy, and a pool built for the old one must not serve the new one.
+
+An asset refresh derives its candidate inside the transaction, from the
+generation current under the update lock, so it can never republish a
+configuration a concurrent control change already replaced.
+
+### Lifecycle
+
+Publication has a commit boundary separate from the update lock: a small
+mutex held only while the compiled candidate is swapped in and while a
+generation's pools are activated. Shutdown closes that boundary before
+retiring the final generation's pools, without waiting for a compile. A
+transaction still compiling — a reload, a refresh, or a control mutation on
+the blocking pool, which dropping its waiter cannot cancel — then fails with
+`ShuttingDown` at commit, and activation after close is a no-op. Pool
+activation after a control publication runs on the publishing thread, so a
+cancelled waiter cannot leave a published generation without its pools.
+
+### Read bounds
+
+Listings are paged (at most 1000 entries and 256 KiB of entries per page,
+always at least one entry) with generation-bound cursors; a cursor from a
+replaced generation is refused rather than stitched across generations.
+Handles are derived once per generation and cached in it. Every operation
+other than `system.status` and `generation.get` runs on the blocking pool,
+at most two at a time across all connections, so control work never occupies
+a Tokio worker that serves proxy traffic.
+
 ### Identity
 
 A VLESS UUID is a credential. It is accepted on `users.create` (or generated
@@ -109,14 +158,17 @@ boundary (for example `/var/lib/rust-reality`) in a later decision.
 ## Consequences
 
 - No relay, record, handshake, or accept path changes. The data plane reads the
-  same immutable snapshot it did before; the only compile-time difference is
-  the `enabled` filter when the short-ID index is built.
-- The only lock the control plane shares with the rest of the process is the
-  existing update mutex, held for a compile exactly as a reload holds it.
+  same immutable snapshot it did before; the compile-time differences are the
+  `enabled` filter when the short-ID index is built and the narrower
+  identity-only compile, which builds the same authenticator and routing
+  table a full compile would.
+- The locks the control plane shares with the rest of the process are the
+  existing update mutex, held for a compile exactly as a reload holds it, and
+  the commit boundary, held for a pointer swap or a pool activation.
 - Resource use is bounded: at most 8 concurrent control connections, one
-  request in flight per connection, a 64 KiB request line, a 60 s idle timeout,
-  a 10 s write-stall timeout, response size bounded by the configuration size
-  bound, and at most one refusal log event per minute.
+  request in flight per connection, at most 2 requests doing work at once, a
+  64 KiB request line, a 60 s idle timeout, a 10 s write-stall timeout, paged
+  listings, and at most one refusal log event per minute.
 - A file reload discards control changes. This is deliberate and observable
   (`controlChanges`), but an operator mixing both workflows must know it.
 - Two new structured events (`control_started`, `control_change_published`)

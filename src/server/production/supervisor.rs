@@ -225,9 +225,7 @@ where
             }
             completed = update_tasks.join_next(), if !update_tasks.is_empty() => {
                 match completed {
-                    Some(Ok((_, Ok(_)))) => {
-                        server.runtime.load().activate_warm_pools();
-                    }
+                    Some(Ok((_, Ok(_)))) => server.runtime.activate_current(),
                     Some(Ok((field, Err(error)))) => {
                         emit_rejected(&server.runtime, field, Some(&error));
                     }
@@ -238,7 +236,10 @@ where
         }
     };
 
-    server.runtime.load().deactivate_warm_pools();
+    // Close the commit boundary first: an update still compiling on the
+    // blocking pool (a reload, a refresh, or a control mutation) can no longer
+    // publish or activate pools, so the generation retired here is the last.
+    server.runtime.close().deactivate_warm_pools();
     update_tasks.abort_all();
     if let Some(task) = monitor_task {
         task.abort();

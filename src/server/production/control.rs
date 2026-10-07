@@ -14,10 +14,20 @@
 //! apart. Nothing here runs on, or shares a lock with, an accept, handshake,
 //! record, or relay path; the only shared state is the store's existing
 //! update mutex.
+//!
+//! Work is bounded independently of connections: reads and mutations both
+//! run on the blocking pool behind [`MAX_BLOCKING_WORK`] permits, listings
+//! are paged, and a request's work never runs on a Tokio worker thread.
+//!
+//! The socket is owned, not merely named: a lock file beside it
+//! (`<socket>.lock`, held with `flock` for the process lifetime) excludes a
+//! second instance configured with the same path, and shutdown unlinks the
+//! path only while it still refers to the socket this process bound.
 
 use std::{
+    fs::{File, OpenOptions},
     io,
-    os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
+    os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -35,10 +45,11 @@ use tokio::{
 use crate::{
     config::{EntryConfig, node::control::ControlConfig},
     control::{
-        ControlError, ErrorCode, Operation, Request, UserHandles, decode_request, mutation,
+        ControlError, ErrorCode, HandleIndex, Operation, Request, UserHandles, decode_request,
+        mutation,
         protocol::{
-            self, MAX_REQUEST_BYTES, MAX_REQUEST_ID_BYTES, OPERATIONS, PROTOCOL_VERSION,
-            SUPPORTED_VERSIONS,
+            self, MAX_PAGE_BYTES, MAX_PAGE_LIMIT, MAX_REQUEST_BYTES, MAX_REQUEST_ID_BYTES,
+            OPERATIONS, PROTOCOL_VERSION, SUPPORTED_VERSIONS,
         },
     },
     logging::LogEvent,
@@ -62,6 +73,12 @@ pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long writing one response may stall.
 pub(super) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Most control requests doing work on the blocking pool at once, across
+/// every connection. A read indexes or pages the live generation and a
+/// mutation compiles one; the bound keeps eight busy controllers from
+/// occupying eight blocking threads or eight copies of a large configuration.
+pub(super) const MAX_BLOCKING_WORK: usize = 2;
+
 /// Longest human-oriented error message sent back. A configuration
 /// diagnostic for a rejected file reload can be long; the journal keeps the
 /// full text.
@@ -76,20 +93,54 @@ pub(super) struct ControlEndpoint {
     listener: UnixListener,
     path: PathBuf,
     owner_uid: u32,
+    /// The bound socket's inode identity, so cleanup removes only it.
+    identity: (u64, u64),
+    /// Held for the endpoint's lifetime; its `flock` is the instance lock.
+    _lock: File,
+}
+
+/// The lock file guarding `socket`: the same path with `.lock` appended.
+pub(super) fn lock_path(socket: &Path) -> PathBuf {
+    let mut path = socket.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
 /// Creates the control socket.
 ///
-/// A stale *socket* at the path (left by a previous process) is removed; any
-/// other kind of file is refused rather than replaced. The socket is made
-/// owner-only before the first accept, and the owning uid is recorded so each
-/// connection's peer credentials can be checked against it.
+/// The instance lock is taken first: `<socket>.lock` is opened (created
+/// owner-only when absent, never truncated or removed) and locked with a
+/// non-blocking exclusive `flock`. A lock held by another process means a
+/// live instance owns the path, and startup fails without touching it.
+/// Holding the lock, a *socket* found at the path can only be stale — no
+/// lock-holding instance exists to have bound it — so removing it races
+/// nothing; any other kind of file is refused rather than replaced. The
+/// socket is made owner-only before the first accept, and the owning uid is
+/// recorded so each connection's peer credentials can be checked against it.
 ///
 /// # Errors
 ///
-/// Returns the I/O error that prevented creating or securing the socket.
+/// Returns `WouldBlock` when another instance holds the lock, or the I/O
+/// error that prevented creating or securing the socket.
 pub(super) fn bind(config: &ControlConfig) -> io::Result<ControlEndpoint> {
     let path = config.socket().to_path_buf();
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock_path(&path))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another process holds the control socket lock",
+            ));
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    }
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(&path)?,
         Ok(_) => {
@@ -103,17 +154,31 @@ pub(super) fn bind(config: &ControlConfig) -> io::Result<ControlEndpoint> {
     }
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    let owner_uid = std::fs::metadata(&path)?.uid();
+    let metadata = std::fs::symlink_metadata(&path)?;
     Ok(ControlEndpoint {
         listener,
         path,
-        owner_uid,
+        owner_uid: metadata.uid(),
+        identity: (metadata.dev(), metadata.ino()),
+        _lock: lock,
     })
 }
 
 impl ControlEndpoint {
     pub(super) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Unlinks the socket path, but only while it is still the socket this
+    /// endpoint bound. Runs while the instance lock is held, so no compliant
+    /// instance can have rebound the path; a file an operator put there
+    /// instead is left alone.
+    fn remove_if_owned(&self) {
+        if std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -125,6 +190,7 @@ pub(super) async fn run(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let work = Arc::new(Semaphore::new(MAX_BLOCKING_WORK));
     let config_path = config_path.map(Arc::<Path>::from);
     let mut connections = JoinSet::new();
     let mut last_refusal: Option<Instant> = None;
@@ -151,8 +217,10 @@ pub(super) async fn run(
                         Ok(permit) => {
                             let runtime = Arc::clone(&runtime);
                             let config_path = config_path.clone();
+                            let work = Arc::clone(&work);
                             connections.spawn(async move {
-                                serve_connection(stream, &runtime, config_path.as_deref()).await;
+                                serve_connection(stream, &runtime, config_path.as_deref(), &work)
+                                    .await;
                                 drop(permit);
                             });
                             None
@@ -183,8 +251,12 @@ pub(super) async fn run(
             }
         }
     }
+    // Aborting a connection cancels its async waiter only. A request already
+    // running on the blocking pool finishes there; it cannot publish, because
+    // the supervisor closed the store's commit boundary before signalling
+    // shutdown, and it activates pools only through that same boundary.
     connections.abort_all();
-    let _ = std::fs::remove_file(&endpoint.path);
+    endpoint.remove_if_owned();
 }
 
 /// The socket is owner-only already; this is the second gate. Only the uid
@@ -199,6 +271,7 @@ async fn serve_connection(
     stream: UnixStream,
     runtime: &Arc<RuntimeStore>,
     config_path: Option<&Path>,
+    work: &Arc<Semaphore>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -237,7 +310,7 @@ async fn serve_connection(
                 if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                respond(&line, runtime, config_path).await
+                respond(&line, runtime, config_path, work).await
             }
         };
         match time::timeout(WRITE_TIMEOUT, writer.write_all(&response)).await {
@@ -252,6 +325,7 @@ pub(super) async fn respond(
     line: &[u8],
     runtime: &Arc<RuntimeStore>,
     config_path: Option<&Path>,
+    work: &Arc<Semaphore>,
 ) -> Vec<u8> {
     let request = match decode_request(line) {
         Ok(request) => request,
@@ -266,7 +340,7 @@ pub(super) async fn respond(
         }
     };
     let id = request.id.clone();
-    match execute(request, runtime, config_path).await {
+    match execute(request, runtime, config_path, work).await {
         Ok((generation, result)) => protocol::encode_success(id.as_deref(), generation, &result),
         Err(error) => protocol::encode_error(
             id.as_deref(),
@@ -293,6 +367,7 @@ async fn execute(
     request: Request,
     runtime: &Arc<RuntimeStore>,
     config_path: Option<&Path>,
+    work: &Arc<Semaphore>,
 ) -> Result<(u64, Value), ControlError> {
     let Request {
         operation,
@@ -302,73 +377,120 @@ async fn execute(
     match &operation {
         Operation::SystemStatus => {
             let snapshot = runtime.load();
-            Ok((snapshot.generation, status(&snapshot)))
+            return Ok((snapshot.generation, status(&snapshot)));
         }
         Operation::GenerationGet => {
             let snapshot = runtime.load();
-            Ok((snapshot.generation, generation(&snapshot)))
+            return Ok((snapshot.generation, generation(&snapshot)));
         }
+        _ => {}
+    }
+    // Everything else does work proportional to the configuration: run it on
+    // the blocking pool, at most `MAX_BLOCKING_WORK` requests at a time.
+    let permit = Arc::clone(work)
+        .acquire_owned()
+        .await
+        .map_err(|_| ControlError::new(ErrorCode::Internal, "the control work queue closed"))?;
+    let store = Arc::clone(runtime);
+    let config_path = config_path.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        let result = execute_blocking(
+            &store,
+            config_path.as_deref(),
+            operation,
+            expected_generation,
+        );
+        drop(permit);
+        result
+    })
+    .await
+    .map_err(|_| ControlError::new(ErrorCode::Internal, "the control task failed"))?
+}
+
+/// Runs one request on the blocking pool.
+///
+/// Everything that must follow a publication — pool activation and the
+/// change event — happens here, on the thread that published, so a waiter
+/// cancelled by shutdown cannot leave a published generation without its
+/// pools. Activation goes through the store's commit boundary and is a no-op
+/// once the store has closed.
+fn execute_blocking(
+    store: &RuntimeStore,
+    config_path: Option<&Path>,
+    operation: Operation,
+    expected_generation: Option<u64>,
+) -> Result<(u64, Value), ControlError> {
+    match &operation {
         Operation::ConfigReload => {
-            let path = config_path.map(Path::to_path_buf).ok_or_else(|| {
+            let path = config_path.ok_or_else(|| {
                 ControlError::new(
                     ErrorCode::Unavailable,
                     "this process was not started from a configuration file",
                 )
             })?;
-            let store = Arc::clone(runtime);
-            let published = tokio::task::spawn_blocking(move || store.reload_path(&path))
-                .await
-                .map_err(|_| ControlError::new(ErrorCode::Internal, "the reload task failed"))?
-                .map_err(update_error)?;
-            let snapshot = runtime.load();
-            snapshot.activate_warm_pools();
-            Ok((published, generation(&snapshot)))
+            let published = store.reload_path(path).map_err(update_error)?;
+            store.activate_current();
+            Ok((published, generation(&store.load())))
         }
-        Operation::UsersList | Operation::UsersGet(_) | Operation::ShortIdsList(_) => {
-            let snapshot = runtime.load();
-            let (entry, handles) = entry_of(&snapshot)?;
+        Operation::UsersList(_) | Operation::UsersGet(_) | Operation::ShortIdsList(_) => {
+            let snapshot = store.load();
+            let entry = entry_config(&snapshot)?;
+            let index = snapshot
+                .handle_index
+                .get_or_init(|| {
+                    UserHandles::from_entry(entry)
+                        .and_then(|handles| HandleIndex::build(entry, &handles))
+                        .map(Arc::new)
+                })
+                .clone()
+                .ok_or_else(|| {
+                    ControlError::new(ErrorCode::Internal, "the user handle key cannot be derived")
+                })?;
             Ok((
                 snapshot.generation,
-                mutation::read(entry, &handles, &operation)?,
+                mutation::read(entry, &index, snapshot.generation, &operation)?,
             ))
         }
         _ => {
             let name = operation.name();
-            let store = Arc::clone(runtime);
-            let (published, result) = tokio::task::spawn_blocking(move || {
-                store.publish_derived(
-                    GenerationOrigin::Control,
-                    expected_generation,
-                    |current| -> Result<_, ControlError> {
-                        let (entry, handles) = entry_of(current)?;
-                        let outcome = mutation::mutate(entry, &handles, &operation)?;
-                        Ok((outcome.config.into_node(), outcome.result))
-                    },
-                )
-            })
-            .await
-            .map_err(|_| ControlError::new(ErrorCode::Internal, "the update task failed"))??;
-            let snapshot = runtime.load();
-            snapshot.activate_warm_pools();
-            emit(
-                &snapshot.logger,
-                &LogEvent::ControlChangePublished {
-                    operation: name,
-                    generation: published,
+            let (published, mut result) = store.publish_derived(
+                GenerationOrigin::Control,
+                expected_generation,
+                |current| -> Result<_, ControlError> {
+                    let (entry, handles) = entry_of(current)?;
+                    let outcome = mutation::mutate(entry, &handles, &operation)?;
+                    Ok((outcome.config.into_node(), outcome.result))
                 },
-            );
-            Ok((published, result))
+            )?;
+            if let Value::Object(fields) = &mut result {
+                fields.insert("changed".to_owned(), Value::Bool(published.changed));
+            }
+            if published.changed {
+                store.activate_current();
+                emit(
+                    &store.load().logger,
+                    &LogEvent::ControlChangePublished {
+                        operation: name,
+                        generation: published.generation,
+                    },
+                );
+            }
+            Ok((published.generation, result))
         }
     }
 }
 
-fn entry_of(snapshot: &RuntimeSnapshot) -> Result<(&EntryConfig, UserHandles), ControlError> {
-    let entry = snapshot.node.as_entry().ok_or_else(|| {
+fn entry_config(snapshot: &RuntimeSnapshot) -> Result<&EntryConfig, ControlError> {
+    snapshot.node.as_entry().ok_or_else(|| {
         ControlError::new(
             ErrorCode::Unavailable,
             "users and short IDs exist only on an entry node",
         )
-    })?;
+    })
+}
+
+fn entry_of(snapshot: &RuntimeSnapshot) -> Result<(&EntryConfig, UserHandles), ControlError> {
+    let entry = entry_config(snapshot)?;
     let handles = UserHandles::from_entry(entry).ok_or_else(|| {
         ControlError::new(ErrorCode::Internal, "the user handle key cannot be derived")
     })?;
@@ -393,6 +515,9 @@ fn status(snapshot: &RuntimeSnapshot) -> Value {
             "maxRequestBytes": MAX_REQUEST_BYTES,
             "maxRequestIdBytes": MAX_REQUEST_ID_BYTES,
             "maxConnections": MAX_CONNECTIONS,
+            "maxConcurrentWork": MAX_BLOCKING_WORK,
+            "maxPageLimit": MAX_PAGE_LIMIT,
+            "maxPageBytes": MAX_PAGE_BYTES,
             "idleTimeoutMs": IDLE_TIMEOUT.as_millis(),
         },
     })
@@ -416,10 +541,13 @@ fn update_error(error: RuntimeUpdateError) -> ControlError {
     let code = match &error {
         RuntimeUpdateError::GenerationConflict { .. } => ErrorCode::GenerationConflict,
         RuntimeUpdateError::Unavailable => ErrorCode::Internal,
+        RuntimeUpdateError::ShuttingDown => ErrorCode::Unavailable,
         _ => ErrorCode::UpdateFailed,
     };
     ControlError::new(code, error.to_string())
 }
 
+#[cfg(test)]
+mod measure;
 #[cfg(test)]
 mod tests;

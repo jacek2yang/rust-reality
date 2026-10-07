@@ -49,6 +49,8 @@ pub enum RuntimeUpdateError {
     Relay(TcpRelayConfigError),
     GenerationExhausted,
     Unavailable,
+    /// The process began shutting down before this update could commit.
+    ShuttingDown,
 }
 
 impl fmt::Display for RuntimeUpdateError {
@@ -99,6 +101,9 @@ impl fmt::Display for RuntimeUpdateError {
             Self::Relay(source) => source.fmt(formatter),
             Self::GenerationExhausted => formatter.write_str("runtime generation exhausted"),
             Self::Unavailable => formatter.write_str("runtime update is unavailable"),
+            Self::ShuttingDown => {
+                formatter.write_str("the server is shutting down; the update was not published")
+            }
         }
     }
 }
@@ -125,7 +130,8 @@ impl Error for RuntimeUpdateError {
             | Self::ControlSocketChanged
             | Self::GenerationConflict { .. }
             | Self::GenerationExhausted
-            | Self::Unavailable => None,
+            | Self::Unavailable
+            | Self::ShuttingDown => None,
         }
     }
 }

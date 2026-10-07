@@ -126,6 +126,23 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
+    /// Recompiles this table for a new user set, keeping its DNS governor.
+    ///
+    /// Equivalent to [`Self::compile`] with the governor this table was built
+    /// with; used when only the users of a generation change.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::compile`].
+    pub(crate) fn recompile(
+        &self,
+        config: &RoutingConfig,
+        clients: &[UserConfig],
+        assets: Arc<dyn AssetMatcher>,
+    ) -> Result<Self, RoutingCompileError> {
+        Self::compile(config, clients, assets, self.dns_governor.clone())
+    }
+
     /// Compiles validated configuration and binds it to one immutable asset snapshot.
     ///
     /// # Errors

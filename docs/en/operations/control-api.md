@@ -25,12 +25,19 @@ account) for this path. See the [configuration reference](../configuration/refer
 
 At startup, after every data listener has bound, the server:
 
-1. removes a stale *socket* left at the path by a previous process, and
-   refuses to start if any other kind of file is there;
-2. creates the socket and sets it to mode `0600`;
-3. accepts only peers whose `SO_PEERCRED` uid owns the socket or is root.
+1. opens `<socket>.lock` beside the socket (created with mode `0600` when
+   absent, never truncated or removed) and takes an exclusive, non-blocking
+   `flock` on it for the life of the process; if another process holds it,
+   startup fails and the existing socket is left untouched;
+2. holding that lock, removes a stale *socket* left at the path by a previous
+   process, and refuses to start if any other kind of file is there;
+3. creates the socket and sets it to mode `0600`;
+4. accepts only peers whose `SO_PEERCRED` uid owns the socket or is root.
 
-The socket is removed at shutdown. There is no TCP listener and no setting
+At shutdown the socket is removed only if the path still names the socket
+this process created (same device and inode); a file someone else put there
+is left alone. The lock file stays, so two instances can never race over
+deleting and recreating it. There is no TCP listener and no setting
 that creates one; reach the socket remotely through your own authenticated
 transport, such as SSH.
 
@@ -82,13 +89,27 @@ UUIDs are credentials. The control interface accepts one on `users.create` (or
 generates one) and returns it exactly once, in that response. No listing,
 error, or log line contains a UUID.
 
-A user view is:
+A user summary, as `users.list` and `users.get` return it, is:
 
 ```json
-{"handle":"u_…","label":"phone","policy":"split","enabled":true,"shortIds":["a1b2c3d4e5f60718"]}
+{"handle":"u_…","label":"phone","policy":"split","enabled":true,"shortIdCount":1}
 ```
 
-`label` and `policy` are omitted when unset.
+A mutation's `user` result is the full view, with `shortIds` in place of
+`shortIdCount`. `label` and `policy` are omitted when unset.
+
+## Listings
+
+`users.list` and `shortIds.list` are paged. They accept `limit` (1–1000,
+default 100) and `cursor`, and return `total` and, while entries remain,
+`nextCursor`. Pass `nextCursor` back as `cursor` to read the next page. A page
+holds whole entries and stops growing at 256 KiB of encoded entries, so it may
+hold fewer than `limit`; it always holds at least one entry when any remain.
+
+A cursor belongs to the generation that issued it. Presenting it after
+another generation was published is refused with `cursorExpired`: restart the
+listing without a cursor. A listing is therefore never stitched together from
+two generations.
 
 ## Operations
 
@@ -97,12 +118,12 @@ A user view is:
 | `system.status` | — | `server` (`name`, `version`, `commit`), `protocol` (`version`, `supported`), `role`, `generation`, `capabilities` (operation names), `limits` |
 | `generation.get` | — | `generation`, `origin`, `controlChanges` |
 | `config.reload` | — | as `generation.get`, for the published generation |
-| `users.list` | — | `users`: user views |
-| `users.get` | `user` | `user` |
+| `users.list` | `cursor`?, `limit`? | `users`: user summaries, `total`, `nextCursor`? |
+| `users.get` | `user` | `user`: a user summary |
 | `users.create` | `id`?, `shortIds`?, `label`?, `policy`?, `enabled`? | `user`, `id` (the UUID, once) |
 | `users.setEnabled` | `user`, `enabled` | `user` |
 | `users.delete` | `user` | `handle` |
-| `shortIds.list` | `user`? | `shortIds`: `shortId`, `user`, `enabled` |
+| `shortIds.list` | `user`?, `cursor`?, `limit`? | `shortIds`: `shortId`, `user`, `enabled`; `total`, `nextCursor`? |
 | `shortIds.add` | `user`, `shortId` | `user` |
 | `shortIds.remove` | `user`, `shortId` | `user` |
 | `shortIds.rotate` | `user`, `retire`?, `bytes`? | `shortId` (the new one), `user` |
@@ -118,6 +139,10 @@ A user view is:
   generation. With no `retire`, old short IDs keep working: distribute the new
   one to clients, then remove the old ones in a second call.
 - Short IDs are compared case-insensitively and stored in lowercase.
+- Every mutation result carries `changed`. A mutation whose result equals the
+  live configuration (for example `users.setEnabled` to the state the user
+  already has) publishes nothing: `changed` is `false` and `generation` is the
+  current one.
 
 ### Generation origin
 
@@ -138,6 +163,22 @@ A mutation is one transaction:
 4. hold it to the configuration size limit and full semantic validation, and
    reject cold changes, exactly as for a configuration file;
 5. compile it and publish it atomically, as a `SIGHUP` reload does.
+
+A candidate that differs from the live configuration only in `users` takes a
+narrower compile: the REALITY authenticator, its short-ID index, and the
+UUID-grouped routing table are rebuilt from the new users, while the loaded
+geo assets, the outbounds and their line-to-landing pools, the cover fallback
+and its pool, and the cover profiles are carried over from the live generation.
+User administration therefore never reads or downloads an asset and never
+cools a warm pool. Any other difference takes the full compile.
+
+An asset refresh is the same kind of transaction: it recompiles the
+configuration that is current under the lock, so it never reverts a control
+change published while it waited.
+
+When the server begins shutting down it closes the store before retiring the
+last generation's pools. A transaction still compiling at that moment fails
+with `unavailable` and publishes nothing.
 
 Consequences:
 
@@ -181,9 +222,10 @@ separately.
 | `generationConflict` | `expectedGeneration` is not current. |
 | `validationFailed` | The resulting configuration fails validation; see `error.path`. |
 | `updateFailed` | Compile or publication failed, or a file reload was rejected. |
-| `unavailable` | The operation needs something this process lacks, such as a configuration file for `config.reload`. |
+| `unavailable` | The operation needs something this process lacks, such as a configuration file for `config.reload`, or the server is shutting down. |
 | `requestTooLarge` | The request line exceeds 64 KiB; the connection is closed. |
 | `busy` | All control connections are in use; the connection is closed. |
+| `cursorExpired` | A listing `cursor` belongs to a replaced generation; restart the listing. |
 | `internal` | An internal invariant failed; nothing changed. |
 
 ## Limits
@@ -194,13 +236,20 @@ separately.
 | request `id` | 128 bytes |
 | concurrent connections | 8 |
 | requests in flight per connection | 1 |
+| requests doing work at once, all connections | 2 |
+| listing page | 1000 entries, 256 KiB of entries |
 | idle time between requests | 60 s |
 | stalled response write | 10 s |
 | error message | 4 KiB |
 | resulting configuration | 4 MiB, the limit for any configuration file |
 
-`system.status` reports the request, connection, and idle limits under
-`limits`.
+Every operation except `system.status` and `generation.get` runs on the
+blocking pool, never on a thread that serves proxy traffic, and at most two
+run at once across all connections; the rest wait their turn. Handles are
+derived once per generation and reused by every read of it.
+
+`system.status` reports the request, connection, work, page, and idle limits
+under `limits`.
 
 ## Events
 

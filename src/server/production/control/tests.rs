@@ -1,5 +1,5 @@
 use std::{
-    os::unix::fs::{FileTypeExt as _, PermissionsExt as _},
+    os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -56,7 +56,8 @@ async fn call(runtime: &Arc<RuntimeStore>, request: Value) -> Value {
 }
 
 async fn call_with_path(runtime: &Arc<RuntimeStore>, request: Value, path: Option<&Path>) -> Value {
-    let line = respond(request.to_string().as_bytes(), runtime, path).await;
+    let work = Arc::new(tokio::sync::Semaphore::new(super::MAX_BLOCKING_WORK));
+    let line = respond(request.to_string().as_bytes(), runtime, path, &work).await;
     assert_eq!(line.last(), Some(&b'\n'), "a response is one line");
     serde_json::from_slice(&line).expect("a response is JSON")
 }
@@ -361,6 +362,158 @@ fn binding_replaces_a_stale_socket_but_never_another_file() {
         assert_eq!(std::fs::read(&regular).expect("untouched"), b"keep");
     });
     let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn a_second_instance_cannot_take_a_live_control_socket() {
+    let directory = scratch_dir("exclusive");
+    let socket = directory.join("control.sock");
+    let config = crate::config::node::control::ControlConfig {
+        socket: socket.clone(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let first = super::bind(&config).expect("first instance binds");
+        let identity = std::fs::symlink_metadata(&socket).expect("socket").ino();
+
+        // A second instance configured with the same path (different data
+        // ports) must fail without unlinking or rebinding the live socket.
+        let second = super::bind(&config).err().expect("the path is owned");
+        assert_eq!(second.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            std::fs::symlink_metadata(&socket)
+                .expect("still there")
+                .ino(),
+            identity,
+            "the live socket must not be replaced"
+        );
+        UnixStream::connect(&socket)
+            .await
+            .expect("the first instance still accepts");
+
+        // The first instance's cleanup removes exactly its own socket, after
+        // which a new instance may bind.
+        first.remove_if_owned();
+        drop(first);
+        assert!(!socket.exists());
+        let third = super::bind(&config).expect("a released path can be bound");
+        third.remove_if_owned();
+    });
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn cleanup_never_removes_a_path_that_no_longer_names_our_socket() {
+    let directory = scratch_dir("replaced");
+    let socket = directory.join("control.sock");
+    let config = crate::config::node::control::ControlConfig {
+        socket: socket.clone(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let endpoint = super::bind(&config).expect("bind");
+        // Someone replaces the path while we run (an operator, or a process
+        // that ignores the lock). Our cleanup must leave their file alone.
+        std::fs::remove_file(&socket).expect("unlink");
+        std::fs::write(&socket, b"theirs").expect("replacement");
+        endpoint.remove_if_owned();
+        assert_eq!(std::fs::read(&socket).expect("kept"), b"theirs");
+    });
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn listings_are_paged_within_one_generation() {
+    let server =
+        ProductionServer::from_config(entry_config(unused_loopback_port())).expect("server");
+    let runtime = &server.runtime;
+    for label in ["a", "b", "c", "d"] {
+        ok(&call(
+            runtime,
+            json!({"v":1,"op":"users.create","args":{"label":label}}),
+        )
+        .await);
+    }
+    let generation = runtime.load().generation;
+
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut args = json!({"limit": 2});
+        if let Some(cursor) = &cursor {
+            args["cursor"] = json!(cursor);
+        }
+        let page = call(runtime, json!({"v":1,"op":"users.list","args":args})).await;
+        assert_eq!(page["generation"], generation);
+        let result = ok(&page);
+        assert_eq!(result["total"], 5);
+        let users = result["users"].as_array().expect("users");
+        assert!(users.len() <= 2);
+        assert!(users.iter().all(|user| user.get("shortIds").is_none()));
+        seen.extend(users.iter().map(|user| user["handle"].clone()));
+        match result.get("nextCursor") {
+            Some(next) => cursor = Some(next.as_str().expect("cursor").to_owned()),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 5);
+
+    // A cursor from a replaced generation is refused, never stitched.
+    let stale = call(runtime, json!({"v":1,"op":"users.list","args":{"limit":1}})).await;
+    let stale = ok(&stale)["nextCursor"]
+        .as_str()
+        .expect("cursor")
+        .to_owned();
+    ok(&call(runtime, json!({"v":1,"op":"users.create","args":{}})).await);
+    let expired = call(
+        runtime,
+        json!({"v":1,"op":"users.list","args":{"cursor":stale}}),
+    )
+    .await;
+    assert_eq!(error_code(&expired), "cursorExpired");
+
+    for args in [
+        json!({"limit":0}),
+        json!({"limit":1001}),
+        json!({"cursor":"x"}),
+    ] {
+        let refused = call(runtime, json!({"v":1,"op":"users.list","args":args})).await;
+        assert_eq!(error_code(&refused), "invalidArgument");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_mutation_that_changes_nothing_reports_it_and_keeps_the_generation() {
+    let server =
+        ProductionServer::from_config(entry_config(unused_loopback_port())).expect("server");
+    let runtime = &server.runtime;
+    let handle = first_handle(runtime).await;
+    let before = runtime.load();
+    let unchanged = call(
+        runtime,
+        json!({"v":1,"op":"users.setEnabled","args":{"user":handle,"enabled":true},
+               "expectedGeneration":0}),
+    )
+    .await;
+    assert_eq!(unchanged["generation"], 0);
+    assert_eq!(ok(&unchanged)["changed"], false);
+    assert!(Arc::ptr_eq(&before, &runtime.load()));
+
+    let created = call(runtime, json!({"v":1,"op":"users.create","args":{}})).await;
+    assert_eq!(ok(&created)["changed"], true);
+    let changed = call(
+        runtime,
+        json!({"v":1,"op":"users.setEnabled","args":{"user":handle,"enabled":false}}),
+    )
+    .await;
+    assert_eq!(changed["generation"], 2);
+    assert_eq!(ok(&changed)["changed"], true);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

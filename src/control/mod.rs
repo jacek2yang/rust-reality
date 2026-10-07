@@ -23,6 +23,6 @@ pub mod handle;
 pub mod mutation;
 pub mod protocol;
 
-pub use handle::UserHandles;
+pub use handle::{HandleIndex, UserHandles};
 pub use mutation::{ControlError, ControlOutcome};
 pub use protocol::{ErrorCode, Operation, Request, RequestError, decode_request};

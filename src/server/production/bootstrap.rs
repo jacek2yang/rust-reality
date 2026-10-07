@@ -250,6 +250,7 @@ pub(super) fn build(
             memory: startup.memory,
             generation: AtomicU64::new(0),
             update: Mutex::new(()),
+            commit: Mutex::new(super::store::CommitState::default()),
         }),
     ))
 }

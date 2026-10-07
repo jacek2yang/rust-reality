@@ -180,7 +180,8 @@ UUIDs are credentials and are never used as resource identifiers: users are
 named by a keyed, non-reversible handle derived from the REALITY private key,
 and a UUID leaves the process only once, in the response that creates it.
 Requests are bounded (64 KiB lines, 8 connections, one request in flight per
-connection, idle and write deadlines), decoded strictly by a fuzzed parser,
+connection, at most two requests doing work at once and none of it on a proxy
+worker thread, paged listings, idle and write deadlines), decoded strictly by a fuzzed parser,
 and every mutation is held to the same validation and size bound as a
 configuration file before it is published as a whole generation. The data
 plane never reads control state directly.

@@ -21,7 +21,7 @@
 //! No state is stored: the handle is recomputed from the configuration, so it
 //! cannot drift from it.
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine as _};
 use hkdf::Hkdf;
@@ -106,6 +106,50 @@ impl UserHandles {
             && value[HANDLE_PREFIX.len()..]
                 .bytes()
                 .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }
+}
+
+/// The handle of every configured user of one generation, computed once.
+///
+/// A generation's users never change, so a read that would otherwise derive
+/// one HMAC per configured user per request derives them once per
+/// generation and then answers by index.
+#[derive(Clone, Debug)]
+pub struct HandleIndex {
+    handles: Vec<String>,
+    positions: HashMap<String, usize>,
+}
+
+impl HandleIndex {
+    /// Indexes `entry`'s users in configuration order.
+    ///
+    /// Returns `None` when a configured user has no handle, which semantic
+    /// validation rules out.
+    #[must_use]
+    pub fn build(entry: &EntryConfig, handles: &UserHandles) -> Option<Self> {
+        let handles = entry
+            .users
+            .iter()
+            .map(|user| handles.handle(&user.id))
+            .collect::<Option<Vec<_>>>()?;
+        let positions = handles
+            .iter()
+            .enumerate()
+            .map(|(index, handle)| (handle.clone(), index))
+            .collect();
+        Some(Self { handles, positions })
+    }
+
+    /// The handle of the user at `index` in configuration order.
+    #[must_use]
+    pub fn handle(&self, index: usize) -> Option<&str> {
+        self.handles.get(index).map(String::as_str)
+    }
+
+    /// The configuration position of the user with `handle`.
+    #[must_use]
+    pub fn position(&self, handle: &str) -> Option<usize> {
+        self.positions.get(handle).copied()
     }
 }
 

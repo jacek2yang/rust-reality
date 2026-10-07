@@ -409,8 +409,11 @@ Cold. Entry nodes only. See the [control API](../operations/control-api.md).
 | `socket` | absolute path | yes | — |
 
 The path names the Unix domain socket the server creates at startup with mode
-`0600`; it is at most 107 bytes, the parent directory must exist, and a stale
-socket at the path is replaced while any other kind of file is refused. There
+`0600`; it is at most 107 bytes and the parent directory must exist. The
+server holds an exclusive lock on `<socket>.lock` beside it for its lifetime,
+so a second instance configured with the same path fails to start; with the
+lock held, a stale socket at the path is replaced while any other kind of
+file is refused. There
 is no network listener and no field to configure one. Changes made through the
 socket are not written back to this file: a reload replaces them.
 

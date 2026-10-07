@@ -24,10 +24,11 @@ use crate::{
 };
 
 use super::{
-    handle::UserHandles,
+    handle::{HandleIndex, UserHandles},
     protocol::{
-        CreateUserArgs, ErrorCode, ListShortIdsArgs, MAX_LABEL_BYTES, MAX_RETIRE, Operation,
-        RotateArgs, SetEnabledArgs, ShortIdArgs, UserArgs,
+        CreateUserArgs, DEFAULT_PAGE_LIMIT, ErrorCode, ListShortIdsArgs, MAX_LABEL_BYTES,
+        MAX_PAGE_BYTES, MAX_PAGE_LIMIT, MAX_RETIRE, Operation, PageArgs, RotateArgs,
+        SetEnabledArgs, ShortIdArgs, UserArgs,
     },
 };
 
@@ -150,50 +151,207 @@ fn short_id_owner(entry: &EntryConfig, short_id: &str) -> Option<usize> {
 
 /// Answers a read-only operation from the live configuration.
 ///
+/// Listings are paged: at most `limit` (bounded by [`MAX_PAGE_LIMIT`])
+/// entries and at most [`MAX_PAGE_BYTES`] of encoded entries per response,
+/// always at least one entry when any remain. `nextCursor` names the next
+/// page of the *same generation*; a cursor presented after another
+/// generation was published is refused with `cursorExpired`, so a listing is
+/// never silently stitched together from two generations. Single-user
+/// results report `shortIdCount`; the short IDs themselves are paged by
+/// `shortIds.list`.
+///
 /// # Errors
 ///
 /// Returns `notFound` for an unknown handle, `invalidArgument` for a
-/// malformed one, and `internal` for an operation that is not a read.
+/// malformed handle, cursor, or limit, `cursorExpired` for a cursor of an
+/// earlier generation, and `internal` for an operation that is not a read.
 pub fn read(
     entry: &EntryConfig,
-    handles: &UserHandles,
+    index: &HandleIndex,
+    generation: u64,
     operation: &Operation,
 ) -> Result<Value, ControlError> {
     match operation {
-        Operation::UsersList => {
-            let users = entry
-                .users
-                .iter()
-                .map(|user| view(handles, user))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(json!({ "users": to_value(&users)? }))
+        Operation::UsersList(PageArgs { cursor, limit }) => {
+            let page = Page::open(cursor.as_deref(), *limit, generation, entry.users.len())?;
+            let mut users = Vec::new();
+            let next = page.fill(&mut users, |position| {
+                summary(index, position, &entry.users[position]).map(Some)
+            })?;
+            Ok(page_result("users", users, entry.users.len(), next))
         }
         Operation::UsersGet(UserArgs { user }) => {
-            let index = position(entry, handles, user)?;
-            Ok(json!({ "user": to_value(&view(handles, &entry.users[index])?)? }))
+            let position = indexed_position(index, user)?;
+            Ok(json!({ "user": summary(index, position, &entry.users[position])? }))
         }
-        Operation::ShortIdsList(ListShortIdsArgs { user }) => {
-            let selected: Vec<&UserConfig> = match user {
-                Some(handle) => vec![&entry.users[position(entry, handles, handle)?]],
-                None => entry.users.iter().collect(),
+        Operation::ShortIdsList(ListShortIdsArgs {
+            user,
+            cursor,
+            limit,
+        }) => {
+            // The flattened listing order: every short ID of the selected
+            // users, users in configuration order.
+            let selected: Vec<usize> = match user {
+                Some(handle) => vec![indexed_position(index, handle)?],
+                None => (0..entry.users.len()).collect(),
             };
-            let mut short_ids = Vec::new();
-            for user in selected {
-                let handle = view(handles, user)?.handle;
-                for short_id in &user.short_ids {
-                    short_ids.push(json!({
-                        "shortId": short_id,
-                        "user": handle,
-                        "enabled": user.enabled(),
-                    }));
-                }
+            let total: usize = selected
+                .iter()
+                .map(|&position| entry.users[position].short_ids.len())
+                .sum();
+            let page = Page::open(cursor.as_deref(), *limit, generation, total)?;
+            // Locate the page's first short ID without materializing any
+            // earlier entry.
+            let mut owners = Vec::with_capacity(selected.len());
+            let mut first = 0;
+            for &position in &selected {
+                owners.push((first, position));
+                first += entry.users[position].short_ids.len();
             }
-            Ok(json!({ "shortIds": short_ids }))
+            let mut short_ids = Vec::new();
+            let next = page.fill(&mut short_ids, |offset| {
+                let owner = owners.partition_point(|(start, _)| *start <= offset) - 1;
+                let (start, position) = owners[owner];
+                let user = &entry.users[position];
+                let handle = index.handle(position).ok_or_else(missing_handle)?;
+                Ok(Some(json!({
+                    "shortId": user.short_ids[offset - start],
+                    "user": handle,
+                    "enabled": user.enabled(),
+                })))
+            })?;
+            Ok(page_result("shortIds", short_ids, total, next))
         }
         _ => Err(ControlError::new(
             ErrorCode::Internal,
             "operation is not a read",
         )),
+    }
+}
+
+/// One user as a listing shows it.
+fn summary(index: &HandleIndex, position: usize, user: &UserConfig) -> Result<Value, ControlError> {
+    let handle = index.handle(position).ok_or_else(missing_handle)?;
+    let mut value = json!({
+        "handle": handle,
+        "enabled": user.enabled(),
+        "shortIdCount": user.short_ids.len(),
+    });
+    if let Some(label) = &user.label {
+        value["label"] = Value::String(label.clone());
+    }
+    if let Some(policy) = &user.policy {
+        value["policy"] = Value::String(policy.clone());
+    }
+    Ok(value)
+}
+
+fn missing_handle() -> ControlError {
+    ControlError::new(ErrorCode::Internal, "a configured user has no handle")
+}
+
+fn indexed_position(index: &HandleIndex, handle: &str) -> Result<usize, ControlError> {
+    if !UserHandles::is_handle(handle) {
+        return Err(ControlError::new(
+            ErrorCode::InvalidArgument,
+            "`user` must be a user handle (`u_` followed by 32 lowercase hexadecimal characters)",
+        ));
+    }
+    index
+        .position(handle)
+        .ok_or_else(ControlError::not_found_user)
+}
+
+fn page_result(name: &str, entries: Vec<Value>, total: usize, next: Option<String>) -> Value {
+    let mut result = serde_json::Map::new();
+    result.insert(name.to_owned(), Value::Array(entries));
+    result.insert("total".to_owned(), json!(total));
+    if let Some(next) = next {
+        result.insert("nextCursor".to_owned(), Value::String(next));
+    }
+    Value::Object(result)
+}
+
+/// The position and bounds of one listing page.
+struct Page {
+    generation: u64,
+    offset: usize,
+    limit: usize,
+    total: usize,
+}
+
+impl Page {
+    fn open(
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        generation: u64,
+        total: usize,
+    ) -> Result<Self, ControlError> {
+        let limit = match limit {
+            None => DEFAULT_PAGE_LIMIT,
+            Some(limit) if (1..=MAX_PAGE_LIMIT).contains(&limit) => limit,
+            Some(_) => {
+                return Err(ControlError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("`limit` must be between 1 and {MAX_PAGE_LIMIT}"),
+                ));
+            }
+        };
+        let offset = match cursor {
+            None => 0,
+            Some(cursor) => {
+                let malformed = || {
+                    ControlError::new(
+                        ErrorCode::InvalidArgument,
+                        "`cursor` must be a `nextCursor` this endpoint returned",
+                    )
+                };
+                let (issued, offset) = cursor.split_once('.').ok_or_else(malformed)?;
+                let issued: u64 = issued.parse().map_err(|_| malformed())?;
+                let offset: usize = offset.parse().map_err(|_| malformed())?;
+                if issued != generation {
+                    return Err(ControlError::new(
+                        ErrorCode::CursorExpired,
+                        "the listing's generation was replaced; start again without a cursor",
+                    ));
+                }
+                if offset == 0 || offset > total {
+                    return Err(malformed());
+                }
+                offset
+            }
+        };
+        Ok(Self {
+            generation,
+            offset,
+            limit,
+            total,
+        })
+    }
+
+    /// Appends entries from the page's offset until the count or byte budget
+    /// is reached, and returns the next page's cursor when entries remain.
+    fn fill(
+        &self,
+        entries: &mut Vec<Value>,
+        mut entry: impl FnMut(usize) -> Result<Option<Value>, ControlError>,
+    ) -> Result<Option<String>, ControlError> {
+        let mut bytes = 0_usize;
+        let mut position = self.offset;
+        while position < self.total && entries.len() < self.limit {
+            let Some(value) = entry(position)? else {
+                break;
+            };
+            // `Value`'s Display is its compact JSON encoding.
+            let size = value.to_string().len();
+            if !entries.is_empty() && bytes.saturating_add(size) > MAX_PAGE_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            entries.push(value);
+            position += 1;
+        }
+        Ok((position < self.total).then(|| format!("{}.{position}", self.generation)))
     }
 }
 
@@ -419,9 +577,10 @@ mod tests {
         config::{EntryConfig, node::fixture},
         control::{
             UserHandles,
+            handle::HandleIndex,
             protocol::{
-                CreateUserArgs, ErrorCode, ListShortIdsArgs, Operation, RotateArgs, SetEnabledArgs,
-                ShortIdArgs, UserArgs,
+                CreateUserArgs, ErrorCode, ListShortIdsArgs, Operation, PageArgs, RotateArgs,
+                SetEnabledArgs, ShortIdArgs, UserArgs,
             },
         },
     };
@@ -453,6 +612,10 @@ mod tests {
         UserHandles::from_entry(entry).expect("fixture key derives")
     }
 
+    fn index(entry: &EntryConfig) -> HandleIndex {
+        HandleIndex::build(entry, &handles(entry)).expect("every fixture user has a handle")
+    }
+
     fn handle_of(entry: &EntryConfig, id: &str) -> String {
         handles(entry).handle(id).expect("UUID has a handle")
     }
@@ -475,7 +638,13 @@ mod tests {
     #[test]
     fn listings_never_contain_a_uuid() {
         let entry = entry();
-        let users = read(&entry, &handles(&entry), &Operation::UsersList).expect("list");
+        let users = read(
+            &entry,
+            &index(&entry),
+            7,
+            &Operation::UsersList(PageArgs::default()),
+        )
+        .expect("list");
         let rendered = users.to_string();
         assert!(
             !rendered.contains(FIRST) && !rendered.contains(SECOND),
@@ -489,7 +658,8 @@ mod tests {
 
         let short_ids = read(
             &entry,
-            &handles(&entry),
+            &index(&entry),
+            7,
             &Operation::ShortIdsList(ListShortIdsArgs::default()),
         )
         .expect("list");
@@ -498,13 +668,90 @@ mod tests {
 
         let one = read(
             &entry,
-            &handles(&entry),
+            &index(&entry),
+            7,
             &Operation::ShortIdsList(ListShortIdsArgs {
                 user: Some(handle_of(&entry, SECOND)),
+                ..ListShortIdsArgs::default()
             }),
         )
         .expect("list one");
         assert_eq!(one["shortIds"][0]["shortId"], "bb");
+    }
+
+    #[test]
+    fn short_id_pages_walk_the_flattened_listing_in_order() {
+        let entry = entry();
+        let index = index(&entry);
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = read(
+                &entry,
+                &index,
+                7,
+                &Operation::ShortIdsList(ListShortIdsArgs {
+                    user: None,
+                    cursor: cursor.clone(),
+                    limit: Some(1),
+                }),
+            )
+            .expect("page");
+            assert_eq!(page["total"], 3);
+            let entries = page["shortIds"].as_array().expect("entries");
+            assert_eq!(entries.len(), 1);
+            seen.push((
+                entries[0]["shortId"].as_str().expect("id").to_owned(),
+                entries[0]["user"].as_str().expect("user").to_owned(),
+            ));
+            match page.get("nextCursor") {
+                Some(next) => cursor = Some(next.as_str().expect("cursor").to_owned()),
+                None => break,
+            }
+        }
+        let first = handle_of(&entry, FIRST);
+        let second = handle_of(&entry, SECOND);
+        assert_eq!(
+            seen,
+            [
+                ("aa".to_owned(), first.clone()),
+                ("ab".to_owned(), first),
+                ("bb".to_owned(), second),
+            ]
+        );
+        let expired = read(
+            &entry,
+            &index,
+            8,
+            &Operation::ShortIdsList(ListShortIdsArgs {
+                cursor: Some("7.1".to_owned()),
+                ..ListShortIdsArgs::default()
+            }),
+        )
+        .expect_err("another generation's cursor");
+        assert_eq!(expired.code, ErrorCode::CursorExpired);
+    }
+
+    #[test]
+    fn a_page_stops_at_its_byte_budget_but_always_makes_progress() {
+        let mut entry = entry();
+        // Each label alone is over half the budget: one entry per page.
+        let label = "x".repeat(super::MAX_PAGE_BYTES / 2 + 1);
+        for user in &mut entry.users {
+            user.label = Some(label.clone());
+        }
+        let page = read(
+            &entry,
+            &index(&entry),
+            7,
+            &Operation::UsersList(PageArgs {
+                cursor: None,
+                limit: Some(1_000),
+            }),
+        )
+        .expect("page");
+        assert_eq!(page["users"].as_array().map(Vec::len), Some(1));
+        assert_eq!(page["nextCursor"], "7.1");
     }
 
     #[test]
@@ -513,7 +760,8 @@ mod tests {
         let get = |user: &str| {
             read(
                 &entry,
-                &handles(&entry),
+                &index(&entry),
+                7,
                 &Operation::UsersGet(UserArgs {
                     user: user.to_owned(),
                 }),
@@ -530,8 +778,8 @@ mod tests {
             ErrorCode::NotFound
         );
         assert_eq!(
-            get(&handle_of(&entry, FIRST)).expect("known")["user"]["shortIds"][1],
-            "ab"
+            get(&handle_of(&entry, FIRST)).expect("known")["user"]["shortIdCount"],
+            2
         );
     }
 
@@ -561,9 +809,14 @@ mod tests {
         assert_eq!(outcome.result["user"]["label"], "new");
         assert!(user.enabled.is_none(), "the default is not written out");
 
-        let listed = read(&created, &handles(&created), &super::Operation::UsersList)
-            .expect("list")
-            .to_string();
+        let listed = read(
+            &created,
+            &index(&created),
+            7,
+            &super::Operation::UsersList(PageArgs::default()),
+        )
+        .expect("list")
+        .to_string();
         assert!(!listed.contains(&id), "a listing never repeats the UUID");
     }
 
@@ -812,15 +1065,19 @@ mod tests {
     fn reads_and_mutations_refuse_each_others_operations() {
         let entry = entry();
         assert_eq!(
-            read(&entry, &handles(&entry), &Operation::ConfigReload)
+            read(&entry, &index(&entry), 7, &Operation::ConfigReload)
                 .expect_err("not a read")
                 .code,
             ErrorCode::Internal
         );
         assert_eq!(
-            mutate(&entry, &handles(&entry), &Operation::UsersList)
-                .expect_err("not a mutation")
-                .code,
+            mutate(
+                &entry,
+                &handles(&entry),
+                &Operation::UsersList(PageArgs::default())
+            )
+            .expect_err("not a mutation")
+            .code,
             ErrorCode::Internal
         );
     }
