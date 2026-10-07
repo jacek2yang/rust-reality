@@ -31,8 +31,50 @@ use super::{
     store::{ListenerReplays, ProcessAuthorities},
 };
 
+/// What produced a generation. Reported by the control interface; never
+/// consulted by a connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GenerationOrigin {
+    /// Generation zero, compiled from the startup configuration.
+    Startup,
+    /// A configuration file reload (`SIGHUP` or `config.reload`).
+    Configuration,
+    /// A scheduled asset refresh of the live configuration.
+    Assets,
+    /// A control-interface mutation.
+    Control,
+}
+
+impl GenerationOrigin {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Configuration => "configuration",
+            Self::Assets => "assets",
+            Self::Control => "control",
+        }
+    }
+}
+
+/// How a generation relates to the configuration file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Provenance {
+    pub(super) origin: GenerationOrigin,
+    /// Whether this generation carries control changes the configuration
+    /// file does not. A file reload replaces them.
+    pub(super) control_changes: bool,
+}
+
+impl Provenance {
+    pub(super) const STARTUP: Self = Self {
+        origin: GenerationOrigin::Startup,
+        control_changes: false,
+    };
+}
+
 pub(super) struct RuntimeSnapshot {
     pub(super) generation: u64,
+    pub(super) provenance: Provenance,
     pub(super) node: NodeConfig,
     pub(super) connections: HashMap<SocketAddr, Arc<ConnectionRuntime>>,
     pub(super) logger: Logger,
@@ -49,6 +91,7 @@ impl RuntimeSnapshot {
         config: NodeConfig,
         policy: &EffectivePolicy,
         generation: u64,
+        provenance: Provenance,
         replay: ReplayCache,
         listener_replays: &ListenerReplays,
         tcp_relay: TcpRelay,
@@ -192,6 +235,7 @@ impl RuntimeSnapshot {
 
         Ok(Self {
             generation,
+            provenance,
             node: config,
             connections,
             logger,

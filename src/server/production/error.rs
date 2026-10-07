@@ -40,6 +40,12 @@ pub enum RuntimeUpdateError {
     DnsPolicyChanged,
     ReplayPolicyChanged,
     ResourceModeChanged,
+    ControlSocketChanged,
+    /// A control-plane mutation named a generation that is no longer current.
+    GenerationConflict {
+        expected: u64,
+        current: u64,
+    },
     Relay(TcpRelayConfigError),
     GenerationExhausted,
     Unavailable,
@@ -83,6 +89,13 @@ impl fmt::Display for RuntimeUpdateError {
             Self::ResourceModeChanged => formatter.write_str(
                 "runtime profile, tuning, or resource-mode changes require a process restart",
             ),
+            Self::ControlSocketChanged => {
+                formatter.write_str("the control socket path requires a process restart")
+            }
+            Self::GenerationConflict { expected, current } => write!(
+                formatter,
+                "expected generation {expected}, but generation {current} is current"
+            ),
             Self::Relay(source) => source.fmt(formatter),
             Self::GenerationExhausted => formatter.write_str("runtime generation exhausted"),
             Self::Unavailable => formatter.write_str("runtime update is unavailable"),
@@ -109,6 +122,8 @@ impl Error for RuntimeUpdateError {
             | Self::DnsPolicyChanged
             | Self::ReplayPolicyChanged
             | Self::ResourceModeChanged
+            | Self::ControlSocketChanged
+            | Self::GenerationConflict { .. }
             | Self::GenerationExhausted
             | Self::Unavailable => None,
         }
@@ -180,6 +195,8 @@ pub enum ProductionServerError {
         source: io::Error,
     },
     ListenerAddress(io::Error),
+    /// The configured control socket could not be created.
+    ControlBind(io::Error),
     Accept(io::Error),
     Signal(io::Error),
     Task(JoinError),
@@ -194,6 +211,7 @@ impl fmt::Display for ProductionServerError {
             Self::Dns(source) => source.fmt(formatter),
             Self::Bind { address, .. } => write!(formatter, "failed to bind listener {address}"),
             Self::ListenerAddress(_) => formatter.write_str("failed to read listener address"),
+            Self::ControlBind(_) => formatter.write_str("failed to create the control socket"),
             Self::Accept(_) => formatter.write_str("listener accept failed"),
             Self::Signal(_) => formatter.write_str("failed to install process signal"),
             Self::Task(_) => formatter.write_str("listener task failed"),
@@ -208,6 +226,7 @@ impl Error for ProductionServerError {
             Self::Runtime(source) => Some(source),
             Self::Bind { source, .. }
             | Self::ListenerAddress(source)
+            | Self::ControlBind(source)
             | Self::Accept(source)
             | Self::Signal(source) => Some(source),
             Self::Task(source) => Some(source),

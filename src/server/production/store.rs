@@ -30,8 +30,11 @@ use crate::{
 };
 
 use super::{
-    error::RuntimeUpdateError, event::emit, reload::ensure_hot_compatible, resources::MemoryWatch,
-    snapshot::RuntimeSnapshot,
+    error::RuntimeUpdateError,
+    event::emit,
+    reload::ensure_hot_compatible,
+    resources::MemoryWatch,
+    snapshot::{GenerationOrigin, Provenance, RuntimeSnapshot},
 };
 use crate::server::{nxr::NxrReplayCache, warm_pool::WarmPoolAuthority};
 
@@ -87,30 +90,82 @@ impl RuntimeStore {
 
     pub(super) fn reload_path(&self, path: &Path) -> Result<u64, RuntimeUpdateError> {
         let config = load(path)?;
-        self.publish(config.into_node())
+        self.publish_as(GenerationOrigin::Configuration, config.into_node())
     }
 
     pub(super) fn refresh(&self) -> Result<u64, RuntimeUpdateError> {
         let node = self.load().node.clone();
-        self.publish(node)
+        self.publish_as(GenerationOrigin::Assets, node)
     }
 
+    #[cfg(test)]
     pub(super) fn publish(&self, config: NodeConfig) -> Result<u64, RuntimeUpdateError> {
+        self.publish_as(GenerationOrigin::Configuration, config)
+    }
+
+    fn publish_as(
+        &self,
+        origin: GenerationOrigin,
+        config: NodeConfig,
+    ) -> Result<u64, RuntimeUpdateError> {
+        self.publish_derived(origin, None, |_| Ok::<_, RuntimeUpdateError>((config, ())))
+            .map(|(generation, ())| generation)
+    }
+
+    /// Derives one candidate from the live generation and publishes it, as a
+    /// single transaction under the update lock.
+    ///
+    /// `derive` sees the generation that is current *after* the lock is
+    /// taken, so two concurrent updates can never both start from the same
+    /// generation and silently discard each other's change. `expected` turns
+    /// the transaction into compare-and-publish: when it no longer names the
+    /// current generation, nothing is derived and nothing changes.
+    pub(super) fn publish_derived<T, E>(
+        &self,
+        origin: GenerationOrigin,
+        expected: Option<u64>,
+        derive: impl FnOnce(&RuntimeSnapshot) -> Result<(NodeConfig, T), E>,
+    ) -> Result<(u64, T), E>
+    where
+        E: From<RuntimeUpdateError>,
+    {
         let _guard = self
             .update
             .lock()
             .map_err(|_| RuntimeUpdateError::Unavailable)?;
         let current = self.load();
+        if let Some(expected) = expected
+            && expected != current.generation
+        {
+            return Err(RuntimeUpdateError::GenerationConflict {
+                expected,
+                current: current.generation,
+            }
+            .into());
+        }
+        let (config, output) = derive(&current)?;
         let config = ensure_hot_compatible(&current, config)?;
         let generation = self
             .generation
             .load(Ordering::Acquire)
             .checked_add(1)
             .ok_or(RuntimeUpdateError::GenerationExhausted)?;
+        let provenance = Provenance {
+            origin,
+            // An asset refresh recompiles the live configuration as it is,
+            // so it inherits whether that configuration still matches the
+            // file; only a file reload makes the two agree again.
+            control_changes: match origin {
+                GenerationOrigin::Startup | GenerationOrigin::Configuration => false,
+                GenerationOrigin::Assets => current.provenance.control_changes,
+                GenerationOrigin::Control => true,
+            },
+        };
         let candidate = RuntimeSnapshot::compile(
             config,
             &self.policy,
             generation,
+            provenance,
             self.replay.clone(),
             &self.listener_replays,
             self.tcp_relay.clone(),
@@ -132,7 +187,7 @@ impl RuntimeStore {
                 generation: published.generation,
             },
         );
-        Ok(generation)
+        Ok((generation, output))
     }
 }
 
