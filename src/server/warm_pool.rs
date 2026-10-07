@@ -78,6 +78,10 @@ impl WarmPoolAuthority {
             .flatten()
     }
 
+    fn ready_capacity_available(&self) -> bool {
+        self.ready.in_use() < self.ready.inner.capacity
+    }
+
     fn speculative_allowed(&self) -> bool {
         self.pressure.state() == ResourcePressure::Normal
     }
@@ -776,6 +780,10 @@ fn reconcile(inner: &Arc<PoolInner>, dials: &mut FuturesUnordered<DialFuture>) {
     if inner.lifecycle.load(Ordering::Acquire) != LIFECYCLE_ACTIVE
         || inner.fd_budget.pressure() != FdPressure::Normal
         || !inner.authority.speculative_allowed()
+        // Hot reload can add pools without increasing process-lifetime limits.
+        // Do not establish sockets that cannot enter any ready slot. Capacity
+        // may race with an in-flight dial; completion still owns admission.
+        || !inner.authority.ready_capacity_available()
     {
         return;
     }
@@ -1439,5 +1447,54 @@ mod tests {
             assert_eq!(authority.counts(), (0, 0));
             assert_eq!(pool.snapshot().connect_failure, 0);
         }
+    }
+    #[test]
+    fn global_ready_saturation_defers_speculative_dials_until_capacity_returns() {
+        use futures_util::stream::FuturesUnordered;
+        use std::sync::atomic::Ordering;
+
+        let mut policy = policy();
+        policy.min_ready = 1;
+        policy.max_ready = 1;
+        policy.max_connecting = 1;
+        policy.refill_batch = 1;
+        // Startup authority can be shared by more warm outbounds after reload.
+        let authority = WarmPoolAuthority::new(&policy, 1, PressureGauge::new());
+        let occupied = authority
+            .try_ready()
+            .expect("existing pool owns ready capacity");
+        let pool = AdaptiveTcpPool::new(
+            Arc::from("127.0.0.1:1"),
+            98,
+            DestinationConnector::new(Duration::from_millis(100)),
+            FdBudget::new(64),
+            authority.clone(),
+            &policy,
+        );
+        // Exercise scheduling without spawning a controller or polling network I/O.
+        pool.inner
+            .lifecycle
+            .store(super::LIFECYCLE_ACTIVE, Ordering::Release);
+        let mut dials: FuturesUnordered<super::DialFuture> = FuturesUnordered::new();
+        for _ in 0..20 {
+            super::reconcile(&pool.inner, &mut dials);
+            assert!(
+                dials.is_empty(),
+                "full ready capacity must not cause pointless dials"
+            );
+        }
+        assert_eq!(pool.snapshot().refill, 0);
+        assert_eq!(authority.counts(), (1, 0));
+        drop(occupied);
+        super::reconcile(&pool.inner, &mut dials);
+        assert_eq!(
+            dials.len(),
+            1,
+            "normal reconciliation resumes after capacity returns"
+        );
+        assert_eq!(authority.counts(), (0, 1));
+        super::cancel_speculative_dials(&pool.inner, &mut dials);
+        pool.deactivate();
+        assert_eq!(authority.counts(), (0, 0));
     }
 }

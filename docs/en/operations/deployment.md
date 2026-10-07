@@ -195,6 +195,13 @@ The backoff does not delay the ordinary cold connection path. Cancelled dials
 and successfully connected sockets discarded before admission are not dial
 failures. These observations do not prove peer health or change retry policy.
 
+A hot reload can add warm outbounds while retaining the process-wide startup
+resource ceiling. When global ready capacity is full, pools defer speculative
+dials rather than repeatedly connecting and discarding sockets. Capacity is
+checked again on local demand or existing maintenance (up to 30 seconds when
+quiet); ordinary cold connections remain available. This does not expand the
+ceiling or promise fair allocation between pools.
+
 ### Verify the start
 
 On every start, confirm in the journal:
