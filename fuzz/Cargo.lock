@@ -1213,6 +1213,7 @@ dependencies = [
  "hickory-resolver",
  "hkdf",
  "hmac",
+ "httparse",
  "ml-kem",
  "regex",
  "ring",

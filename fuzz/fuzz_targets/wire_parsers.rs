@@ -2,6 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use rust_reality::protocol::{
+    http_proxy::{decode_basic_credentials, decode_http_proxy_request},
     nxr::{NxrKey, decode_authenticated_request, request_len_from_header},
     reality::ClientHello,
     socks5::{
@@ -69,6 +70,18 @@ fuzz_target!(|input: &[u8]| {
         assert!(!credentials.username().is_empty());
         assert!(!credentials.password().is_empty());
     }
+    if let Ok(request) = decode_http_proxy_request(input) {
+        assert!(request.consumed() <= input.len());
+        for header in request.forward_headers() {
+            assert!(!header.name().eq_ignore_ascii_case("proxy-authorization"));
+            assert!(!header.name().eq_ignore_ascii_case("proxy-authenticate"));
+            assert!(!header.name().eq_ignore_ascii_case("connection"));
+        }
+        if let Some(value) = request.proxy_authorization() {
+            let _ = decode_basic_credentials(value);
+        }
+    }
+    let _ = decode_basic_credentials(input);
     if let Ok(decoded) = decode_connect_request(input) {
         assert!(decoded.consumed() <= input.len());
         assert_eq!(decoded.payload(), &input[decoded.consumed()..]);
