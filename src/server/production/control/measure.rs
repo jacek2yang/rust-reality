@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 
 use super::execute_blocking;
 use crate::{
-    config::{NodeConfig, node::UserConfig},
+    config::{MAX_CONFIG_BYTES, NodeConfig, node::UserConfig},
     control::{Operation, protocol::PageArgs},
     server::production::{
         ProductionServer,
@@ -40,15 +40,17 @@ use crate::{
 };
 
 const USERS: usize = 5_000;
+const MAX_CONFIG_USERS: usize = 40_000;
+const MAX_PAGE_ENTRIES: usize = 1_000;
 const PUBLICATIONS: usize = 20;
 const READS: usize = 200;
 const PROBE: Duration = Duration::from_millis(1_500);
 
-fn many_users(port: u16) -> NodeConfig {
+fn many_users(port: u16, users: usize) -> NodeConfig {
     let mut node = entry_config(port).into_node();
     if let NodeConfig::Entry(entry) = &mut node {
         let template = entry.users[0].clone();
-        for index in 1..USERS {
+        for index in 1..users {
             entry.users.push(UserConfig {
                 id: format!("{index:08x}-0000-4000-8000-{index:012x}"),
                 short_ids: vec![format!("{:016x}", index + 0x1000)],
@@ -103,17 +105,21 @@ fn toggle(store: &RuntimeStore, user: usize, enabled: bool) {
 }
 
 fn read_page(store: &RuntimeStore) {
+    std::hint::black_box(read_page_with_limit(store, 100));
+}
+
+fn read_page_with_limit(store: &RuntimeStore, limit: usize) -> Value {
     let (_, result) = execute_blocking(
         store,
         None,
         Operation::UsersList(PageArgs {
             cursor: None,
-            limit: Some(100),
+            limit: Some(limit),
         }),
         None,
     )
     .expect("a page reads");
-    std::hint::black_box(result);
+    result
 }
 
 /// Per-lookup latency of what an accept does with a generation: load the
@@ -140,7 +146,9 @@ fn control_plane_cost_report() {
     let port = unused_loopback_port();
     let server = ProductionServer::from_config(entry_config(port)).expect("server");
     let store = Arc::clone(&server.runtime);
-    store.publish(many_users(port)).expect("many users publish");
+    store
+        .publish(many_users(port, USERS))
+        .expect("many users publish");
     let address = *store.load().connections.keys().next().expect("a listener");
 
     let full = (0..PUBLICATIONS)
@@ -177,6 +185,36 @@ fn control_plane_cost_report() {
         "fullCompile": allocations(|| { store.refresh().expect("full"); }),
         "identityOnly": allocations(|| toggle(&store, 2, false)),
         "pageReadSteady": allocations(|| read_page(&store)),
+    });
+
+    let large_port = unused_loopback_port();
+    let large_server =
+        ProductionServer::from_config(entry_config(large_port)).expect("large server");
+    let large_store = Arc::clone(&large_server.runtime);
+    large_store
+        .publish(many_users(large_port, MAX_CONFIG_USERS))
+        .expect("near-maximum user config publishes");
+    let config_bytes = serde_json::to_vec(&large_store.load().node)
+        .expect("large config serializes")
+        .len();
+    assert!(config_bytes <= MAX_CONFIG_BYTES);
+    assert!(config_bytes >= MAX_CONFIG_BYTES * 9 / 10);
+    let large_first_page = time(|| {
+        std::hint::black_box(read_page_with_limit(&large_store, MAX_PAGE_ENTRIES));
+    });
+    let large_reads = (0..READS)
+        .map(|_| {
+            time(|| {
+                std::hint::black_box(read_page_with_limit(&large_store, MAX_PAGE_ENTRIES));
+            })
+        })
+        .collect();
+    let large_page = read_page_with_limit(&large_store, MAX_PAGE_ENTRIES);
+    let large_page_bytes = serde_json::to_vec(&large_page)
+        .expect("page serializes")
+        .len();
+    let large_page_allocation = allocations(|| {
+        std::hint::black_box(read_page_with_limit(&large_store, MAX_PAGE_ENTRIES));
     });
 
     let idle = probe_accept_path(&store, address);
@@ -229,6 +267,15 @@ fn control_plane_cost_report() {
         "read": {
             "firstPageUs": first_read.as_secs_f64() * 1e6,
             "steadyPage": summary(reads),
+            "nearMaximumConfig": {
+                "users": MAX_CONFIG_USERS,
+                "configBytes": config_bytes,
+                "pageEntries": MAX_PAGE_ENTRIES,
+                "pageResponseBytes": large_page_bytes,
+                "firstPageUs": large_first_page.as_secs_f64() * 1e6,
+                "steadyPage": summary(large_reads),
+                "steadyPageAllocations": large_page_allocation,
+            },
         },
         "allocations": allocation,
         "acceptPathLookup": {

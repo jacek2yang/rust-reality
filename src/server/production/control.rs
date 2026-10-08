@@ -430,7 +430,10 @@ fn execute_blocking(
             })?;
             let published = store.reload_path(path).map_err(update_error)?;
             store.activate_current();
-            Ok((published, generation(&store.load())))
+            Ok((
+                published,
+                generation_at(published, GenerationOrigin::Configuration, false),
+            ))
         }
         Operation::UsersList(_) | Operation::UsersGet(_) | Operation::ShortIdsList(_) => {
             let snapshot = store.load();
@@ -524,10 +527,18 @@ fn status(snapshot: &RuntimeSnapshot) -> Value {
 }
 
 fn generation(snapshot: &RuntimeSnapshot) -> Value {
+    generation_at(
+        snapshot.generation,
+        snapshot.provenance.origin,
+        snapshot.provenance.control_changes,
+    )
+}
+
+fn generation_at(generation: u64, origin: GenerationOrigin, control_changes: bool) -> Value {
     json!({
-        "generation": snapshot.generation,
-        "origin": snapshot.provenance.origin.as_str(),
-        "controlChanges": snapshot.provenance.control_changes,
+        "generation": generation,
+        "origin": origin.as_str(),
+        "controlChanges": control_changes,
     })
 }
 

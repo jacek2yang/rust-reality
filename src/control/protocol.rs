@@ -384,6 +384,15 @@ pub fn decode_request(line: &[u8]) -> Result<Request, RequestError> {
             ));
         }
     }
+    for field in ["args", "expectedGeneration"] {
+        if object.get(field).is_some_and(Value::is_null) {
+            return Err(RequestError::new(
+                id,
+                ErrorCode::InvalidRequest,
+                format!("`{field}` must be omitted instead of null"),
+            ));
+        }
+    }
     let envelope: Envelope = serde_json::from_value(Value::Object(object)).map_err(|_| {
         RequestError::new(
             id.clone(),
@@ -623,6 +632,14 @@ mod tests {
             ),
             (
                 json!({"v":1,"op":"users.delete","args":{"user":"u"},"expectedGeneration":-1}),
+                ErrorCode::InvalidRequest,
+            ),
+            (
+                json!({"v":1,"op":"users.list","args":null}),
+                ErrorCode::InvalidRequest,
+            ),
+            (
+                json!({"v":1,"op":"users.delete","args":{"user":"u"},"expectedGeneration":null}),
                 ErrorCode::InvalidRequest,
             ),
         ] {

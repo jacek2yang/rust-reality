@@ -574,13 +574,16 @@ mod tests {
 
     use super::{ControlError, mutate, read};
     use crate::{
-        config::{EntryConfig, node::fixture},
+        config::{
+            EntryConfig, MAX_CONFIG_BYTES, NodeConfig,
+            node::{UserConfig, fixture},
+        },
         control::{
             UserHandles,
             handle::HandleIndex,
             protocol::{
-                CreateUserArgs, ErrorCode, ListShortIdsArgs, Operation, PageArgs, RotateArgs,
-                SetEnabledArgs, ShortIdArgs, UserArgs,
+                CreateUserArgs, ErrorCode, ListShortIdsArgs, MAX_PAGE_BYTES, Operation, PageArgs,
+                RotateArgs, SetEnabledArgs, ShortIdArgs, UserArgs,
             },
         },
     };
@@ -752,6 +755,46 @@ mod tests {
         .expect("page");
         assert_eq!(page["users"].as_array().map(Vec::len), Some(1));
         assert_eq!(page["nextCursor"], "7.1");
+    }
+
+    #[test]
+    fn a_max_config_sized_user_listing_stays_within_the_page_budget() {
+        let mut entry = entry();
+        let template = entry.users[0].clone();
+        for index in 2..40_000 {
+            entry.users.push(UserConfig {
+                id: format!("{index:08x}-0000-4000-8000-{index:012x}"),
+                short_ids: vec![format!("{:016x}", index + 0x1000)],
+                label: Some(format!("user-{index}")),
+                enabled: None,
+                ..template.clone()
+            });
+        }
+        let encoded = serde_json::to_vec(&NodeConfig::Entry(Box::new(entry.clone())))
+            .expect("fixture serializes");
+        assert!(encoded.len() <= MAX_CONFIG_BYTES);
+        assert!(
+            encoded.len() >= MAX_CONFIG_BYTES * 9 / 10,
+            "fixture should approach the supported configuration limit: {} bytes",
+            encoded.len()
+        );
+
+        let page = read(
+            &entry,
+            &index(&entry),
+            7,
+            &Operation::UsersList(PageArgs {
+                cursor: None,
+                limit: Some(1_000),
+            }),
+        )
+        .expect("bounded page");
+        assert_eq!(page["total"], entry.users.len());
+        assert!(page["users"].as_array().expect("users").len() <= 1_000);
+        assert!(
+            page.to_string().len() <= MAX_PAGE_BYTES + 128,
+            "the complete response stays within the page budget plus fixed JSON overhead"
+        );
     }
 
     #[test]

@@ -251,6 +251,8 @@ pub(super) fn build(
             generation: AtomicU64::new(0),
             update: Mutex::new(()),
             commit: Mutex::new(super::store::CommitState::default()),
+            #[cfg(test)]
+            update_waiters: std::sync::atomic::AtomicUsize::new(0),
         }),
     ))
 }

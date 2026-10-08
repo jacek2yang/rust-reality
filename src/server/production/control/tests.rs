@@ -15,7 +15,7 @@ use tokio::{
     sync::oneshot,
 };
 
-use super::{MAX_CONNECTIONS, respond};
+use super::{MAX_CONNECTIONS, generation_at, respond};
 use crate::{
     config::{ValidatedConfig, node::fixture},
     control::protocol::MAX_REQUEST_BYTES,
@@ -78,6 +78,17 @@ async fn first_handle(runtime: &Arc<RuntimeStore>) -> String {
         .as_str()
         .expect("a handle")
         .to_owned()
+}
+
+#[test]
+fn reload_generation_metadata_stays_bound_to_the_published_generation() {
+    let published = generation_at(7, super::GenerationOrigin::Configuration, false);
+    let later = generation_at(8, super::GenerationOrigin::Control, true);
+
+    assert_eq!(published["generation"], 7);
+    assert_eq!(published["origin"], "configuration");
+    assert_eq!(published["controlChanges"], false);
+    assert_ne!(published, later);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -64,6 +64,10 @@ pub(super) struct RuntimeStore {
     /// Held only for that pointer swap and for pool activation, never for a
     /// compile, so shutdown waits microseconds rather than a whole compile.
     pub(super) commit: Mutex<CommitState>,
+    /// Counts callers which have started acquiring the update mutex; test-only
+    /// so concurrency regressions can synchronize without timing sleeps.
+    #[cfg(test)]
+    pub(super) update_waiters: std::sync::atomic::AtomicUsize,
 }
 
 /// Whether the store still accepts publications.
@@ -200,10 +204,12 @@ impl RuntimeStore {
     where
         E: From<RuntimeUpdateError>,
     {
-        let _guard = self
-            .update
-            .lock()
-            .map_err(|_| RuntimeUpdateError::Unavailable)?;
+        #[cfg(test)]
+        self.update_waiters.fetch_add(1, Ordering::AcqRel);
+        let update = self.update.lock();
+        #[cfg(test)]
+        self.update_waiters.fetch_sub(1, Ordering::AcqRel);
+        let _guard = update.map_err(|_| RuntimeUpdateError::Unavailable)?;
         let current = self.load();
         if let Some(expected) = expected
             && expected != current.generation
@@ -578,9 +584,17 @@ mod tests {
             let runtime = Arc::clone(runtime);
             std::thread::spawn(move || runtime.refresh())
         };
-        // Give a refresh that (incorrectly) read its base before locking the
-        // chance to do so; the outcome asserted below holds for any schedule.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Wait until refresh has reached the update-lock acquisition while G1
+        // still holds it. This makes the stale-base interleaving deterministic
+        // without relying on scheduler timing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime.update_waiters.load(Ordering::Acquire) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refresh must reach the update-lock wait"
+            );
+            std::thread::yield_now();
+        }
         release.send(()).expect("release the control derive step");
 
         let control = control
@@ -823,5 +837,47 @@ mod tests {
             "releasing the permit must free the rate gate after reloads"
         );
         held.clear();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_spawn_blocking_waiter_cannot_publish_after_shutdown() {
+        let port = unused_loopback_port();
+        let server = ProductionServer::from_config(entry_config(port)).expect("server");
+        let runtime = Arc::clone(&server.runtime);
+        let candidate = with_extra_outbound(port, "late-control-update");
+        let (entered_sender, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished_sender, finished) = std::sync::mpsc::channel();
+
+        let waiter = tokio::task::spawn_blocking(move || {
+            let result = runtime.publish_derived(GenerationOrigin::Control, None, move |_| {
+                entered_sender.send(()).expect("test is waiting");
+                released.recv().expect("test releases the update");
+                Ok::<_, RuntimeUpdateError>((candidate, ()))
+            });
+            finished_sender
+                .send(result.map(|(published, ())| published))
+                .expect("test observes the blocking task result");
+        });
+
+        entered
+            .recv()
+            .expect("the blocking update is in flight under the update lock");
+        // This is what dropping a cancelled connection's JoinHandle does: it
+        // drops the async waiter, not the already-started blocking closure.
+        drop(waiter);
+        let last = server.runtime.close();
+        assert_eq!(last.generation, 0);
+        release.send(()).expect("release the blocking update");
+
+        assert!(matches!(
+            finished
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("blocking closure must finish"),
+            Err(RuntimeUpdateError::ShuttingDown)
+        ));
+        assert!(Arc::ptr_eq(&last, &server.runtime.load()));
+        assert_eq!(server.runtime.generation.load(Ordering::Acquire), 0);
+        assert!(last.pre_auth_generation.is_active());
     }
 }
