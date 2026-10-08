@@ -13,6 +13,7 @@ pub(crate) use decode::decode_request_ref;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use decode::fuzz_decode_request_ref;
+pub(crate) use decode::is_domain_byte;
 pub use decode::{DecodeError, DecodeRequest, decode_request};
 pub use padding::{EntropyUnavailable, PaddingRng};
 pub use read::{ReadError, ReadRequest, read_request};

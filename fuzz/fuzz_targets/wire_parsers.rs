@@ -4,6 +4,10 @@ use libfuzzer_sys::fuzz_target;
 use rust_reality::protocol::{
     nxr::{NxrKey, decode_authenticated_request, request_len_from_header},
     reality::ClientHello,
+    socks5::{
+        MAX_CONNECT_REQUEST_LEN, decode_connect_request, decode_method_request,
+        encode_connect_request,
+    },
     vless::{
         Command, decode_request, decode_response, encode_vision_tcp_request,
         fuzz_decode_request_ref,
@@ -31,6 +35,22 @@ fuzz_target!(|input: &[u8]| {
         assert_eq!(decoded.payload(), &input[header_len..]);
     }
     fuzz_decode_request_ref(input);
+    if let Ok(decoded) = decode_method_request(input) {
+        assert!(decoded.consumed() <= input.len());
+        assert_eq!(decoded.trailing(), &input[decoded.consumed()..]);
+    }
+    if let Ok(decoded) = decode_connect_request(input) {
+        assert!(decoded.consumed() <= input.len());
+        assert_eq!(decoded.payload(), &input[decoded.consumed()..]);
+
+        let mut encoded = [0_u8; MAX_CONNECT_REQUEST_LEN];
+        if let Ok(written) = encode_connect_request(decoded.destination(), &mut encoded) {
+            let round_trip = decode_connect_request(&encoded[..written]).expect("encoded CONNECT");
+            assert_eq!(round_trip.destination(), decoded.destination());
+            assert_eq!(round_trip.consumed(), written);
+            assert!(round_trip.payload().is_empty());
+        }
+    }
     if let Ok(hello) = ClientHello::parse_message(input) {
         let _ = hello.normalized_profile_class();
     }
