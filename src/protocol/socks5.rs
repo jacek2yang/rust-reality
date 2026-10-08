@@ -17,7 +17,9 @@ use std::{
     str,
 };
 
-use super::vless::{Address, Destination, is_domain_byte};
+use super::vless::{
+    Address, Destination, DestinationValidationError, is_valid_domain_name, validate_destination,
+};
 
 /// SOCKS protocol version defined by RFC 1928.
 pub const VERSION: u8 = 0x05;
@@ -124,6 +126,8 @@ pub enum DecodeError {
     UnsupportedAddressType(u8),
     /// A domain destination declared zero name bytes.
     EmptyDomain,
+    /// A TCP CONNECT destination port must be nonzero.
+    ZeroPort,
     /// A domain contains bytes outside the canonical VLESS domain grammar.
     InvalidDomainName,
 }
@@ -164,6 +168,9 @@ impl fmt::Display for DecodeError {
                 )
             }
             Self::EmptyDomain => formatter.write_str("SOCKS5 domain destination must not be empty"),
+            Self::ZeroPort => {
+                formatter.write_str("SOCKS5 TCP CONNECT destination port must be nonzero")
+            }
             Self::InvalidDomainName => formatter.write_str("SOCKS5 domain destination is invalid"),
         }
     }
@@ -176,6 +183,8 @@ impl Error for DecodeError {}
 pub enum EncodeError {
     /// The supplied output slice cannot hold the complete message.
     OutputTooSmall { required: usize, available: usize },
+    /// A TCP CONNECT destination port must be nonzero.
+    ZeroPort,
     /// The canonical destination contains an empty or invalid domain name.
     InvalidDomainName,
 }
@@ -190,6 +199,9 @@ impl fmt::Display for EncodeError {
                 formatter,
                 "SOCKS5 output needs {required} bytes, buffer has {available}"
             ),
+            Self::ZeroPort => {
+                formatter.write_str("SOCKS5 TCP CONNECT destination port must be nonzero")
+            }
             Self::InvalidDomainName => formatter.write_str("SOCKS5 domain destination is invalid"),
         }
     }
@@ -280,9 +292,11 @@ pub fn decode_connect_request(input: &[u8]) -> Result<ConnectRequest<'_>, Decode
     };
     let port = cursor.read_u16("destination port")?;
     let consumed = cursor.position;
+    let destination = Destination::new(address, port);
+    validate_destination(&destination).map_err(map_validation_to_decode)?;
 
     Ok(ConnectRequest {
-        destination: Destination::new(address, port),
+        destination,
         consumed,
         payload: cursor.remaining_slice(),
     })
@@ -297,7 +311,8 @@ pub fn encode_connect_request(
     destination: &Destination,
     output: &mut [u8],
 ) -> Result<usize, EncodeError> {
-    let required = connect_request_len(destination)?;
+    validate_destination(destination).map_err(map_validation_to_encode)?;
+    let required = connect_request_len(destination);
     ensure_capacity(output, required)?;
 
     output[0] = VERSION;
@@ -327,19 +342,11 @@ pub fn encode_connect_request(
     Ok(required)
 }
 
-fn connect_request_len(destination: &Destination) -> Result<usize, EncodeError> {
+fn connect_request_len(destination: &Destination) -> usize {
     match destination.address() {
-        Address::Ipv4(_) => Ok(4 + 4 + 2),
-        Address::Ipv6(_) => Ok(4 + 16 + 2),
-        Address::Domain(domain) => {
-            if domain.is_empty()
-                || domain.len() > usize::from(u8::MAX)
-                || !domain.bytes().all(is_domain_byte)
-            {
-                return Err(EncodeError::InvalidDomainName);
-            }
-            Ok(4 + 1 + domain.len() + 2)
-        }
+        Address::Ipv4(_) => 4 + 4 + 2,
+        Address::Ipv6(_) => 4 + 16 + 2,
+        Address::Domain(domain) => 4 + 1 + domain.len() + 2,
     }
 }
 
@@ -350,11 +357,25 @@ fn decode_domain(cursor: &mut Cursor<'_>) -> Result<Address, DecodeError> {
     }
 
     let bytes = cursor.take(length, "domain name")?;
-    if !bytes.iter().copied().all(is_domain_byte) {
+    if !is_valid_domain_name(bytes) {
         return Err(DecodeError::InvalidDomainName);
     }
     let domain = str::from_utf8(bytes).map_err(|_| DecodeError::InvalidDomainName)?;
     Ok(Address::Domain(domain.to_owned()))
+}
+
+fn map_validation_to_decode(error: DestinationValidationError) -> DecodeError {
+    match error {
+        DestinationValidationError::ZeroPort => DecodeError::ZeroPort,
+        DestinationValidationError::InvalidDomain => DecodeError::InvalidDomainName,
+    }
+}
+
+fn map_validation_to_encode(error: DestinationValidationError) -> EncodeError {
+    match error {
+        DestinationValidationError::ZeroPort => EncodeError::ZeroPort,
+        DestinationValidationError::InvalidDomain => EncodeError::InvalidDomainName,
+    }
 }
 
 fn ensure_capacity(output: &[u8], required: usize) -> Result<(), EncodeError> {
@@ -478,17 +499,19 @@ mod tests {
 
     #[test]
     fn encodes_both_method_selection_values() {
-        let mut output = [0xa5; 2];
+        let mut output = [0xa5; 4];
         assert_eq!(
             encode_method_response(MethodResponse::NoAuthentication, &mut output),
             Ok(2)
         );
-        assert_eq!(output, [VERSION, 0]);
+        assert_eq!(&output[..2], &[VERSION, 0]);
+        assert_eq!(&output[2..], &[0xa5; 2]);
         assert_eq!(
             encode_method_response(MethodResponse::NoAcceptableMethods, &mut output),
             Ok(2)
         );
-        assert_eq!(output, [VERSION, 0xff]);
+        assert_eq!(&output[..2], &[VERSION, 0xff]);
+        assert_eq!(&output[2..], &[0xa5; 2]);
     }
 
     #[test]
@@ -514,13 +537,14 @@ mod tests {
                 Address::Ipv6("2001:db8::19".parse().expect("IPv6 literal")),
                 65535,
             ),
-            Destination::new(Address::Domain("example.com".to_owned()), 0),
+            Destination::new(Address::Domain("example.com".to_owned()), 1),
         ];
 
         for destination in destinations {
-            let mut output = [0_u8; MAX_CONNECT_REQUEST_LEN];
+            let mut output = [0xa5; MAX_CONNECT_REQUEST_LEN];
             let written = encode_connect_request(&destination, &mut output)
                 .expect("canonical destination should encode");
+            assert!(output[written..].iter().all(|&byte| byte == 0xa5));
             let decoded = decode_connect_request(&output[..written])
                 .expect("encoded CONNECT request should decode");
             assert_eq!(decoded.destination(), &destination);
@@ -612,6 +636,10 @@ mod tests {
             Err(DecodeError::UnsupportedCommand(3))
         );
         assert_eq!(
+            decode_connect_request(&[VERSION, 1, 0, 1, 127, 0, 0, 1, 0, 0]),
+            Err(DecodeError::ZeroPort)
+        );
+        assert_eq!(
             decode_connect_request(&[VERSION, 1, 0, 2]),
             Err(DecodeError::UnsupportedAddressType(2))
         );
@@ -672,6 +700,13 @@ mod tests {
             );
             assert_eq!(output, [0xa5; MAX_CONNECT_REQUEST_LEN]);
         }
+
+        let zero_port = Destination::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 0);
+        assert_eq!(
+            encode_connect_request(&zero_port, &mut output),
+            Err(EncodeError::ZeroPort)
+        );
+        assert_eq!(output, [0xa5; MAX_CONNECT_REQUEST_LEN]);
     }
 
     #[test]
